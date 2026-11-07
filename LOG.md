@@ -133,3 +133,19 @@
 - tcllib json2dict maps JSON null to the string "null".
 - Brace-quoting a Tcl literal turns backslash-newline into a space. When generating code
   via strings, use an at-CONT-at marker and string-map it to backslash + newline.
+
+# Session Log
+
+## Environment-based HTTPS proxy and GUI fixes
+
+- Replaced `autoproxy` in `bootstrap.tcl` with a small proxy detector that reads `http_proxy`, then `HTTP_PROXY`.
+- Added parsing for HTTP proxy URLs, including host, optional port, credentials, and trailing slash. The default proxy port is `80`; proxy settings are cleared when no environment variable is set.
+- Diagnosed the HTTPS handshake failure: Tcl's `http` package connected to the proxy, but `::tls::socket` attempted TLS directly with the proxy instead of tunneling to the destination.
+- Implemented `::featherweight::tls_socket` to establish an HTTP `CONNECT` tunnel, validate its response, and then start TLS with the destination hostname for SNI. Direct HTTPS remains supported without a proxy.
+- Verified plain HTTP through `http://192.168.1.101:20171`.
+- Verified proxied HTTPS and repeated `POST` requests to the OpenRouter completions endpoint.
+- Verified an authenticated proxied request using `OPENROUTER_API_KEY`: HTTP `200`, transport `ok`, assistant response `proxy OK`.
+- Fixed the asynchronous GUI response handler to accept Tcl HTTP's successful `ok` status as well as `complete`.
+- Updated failure logging to include `::http::error` and capture it before cleaning up the HTTP token.
+- Verified an authenticated asynchronous request using the GUI request pattern: HTTP `200`, assistant response `async OK`.
+
