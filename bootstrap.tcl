@@ -18,7 +18,7 @@ namespace eval ::featherweight {
         \
         apiKeyEnvVar OPENROUTER_API_KEY \
         endpoint https://openrouter.ai/api/v1/chat/completions \
-        model xiaomi/mimo-v2.6-flash \
+        model deepseek/deepseek-v4.1-flash-1017 \
         systemPrompt {You are an expert software developer working with a user on their code.
 The user will ask for changes to the code, or ask questions about it.
 If a request is ambiguous, ask clarifying questions before making changes.
@@ -156,16 +156,51 @@ proc ::featherweight::json-tool args {
     ]
 }
 
+proc ::featherweight::json-tool-call call {
+    set function [dict get $call function]
+
+    return [::json::write object \
+        id [::json::write string [dict get $call id]] \
+        type [::json::write string [dict get $call type]] \
+        function [::json::write object \
+            name [::json::write string [dict get $function name]] \
+            arguments [::json::write string [dict get $function arguments]] \
+        ] \
+    ]
+}
+
+proc ::featherweight::json-message message {
+    set fields {}
+
+    dict for {key value} $message {
+        if {$key eq {tool_calls}} {
+            set calls {}
+
+            foreach call $value {
+                lappend calls [::featherweight::json-tool-call $call]
+            }
+
+            lappend fields tool_calls [::json::write array {*}$calls]
+        } else {
+            lappend fields $key [::json::write string $value]
+        }
+    }
+
+    return [::json::write object {*}$fields]
+}
+
+
 proc ::featherweight::json-payload {model jsonTools messages} {
     set jsonMessages [lmap message $messages {
-        ::json::write object-strings {*}$message
+        ::featherweight::json-message $message
     }]
 
     return [::json::write object \
         model [::json::write string $model] \
         messages [::json::write array {*}$jsonMessages] \
+        reasoning [::json::write object effort [::json::write string low]] \
         tools [::json::write array {*}$jsonTools] \
-        tool_choice auto \
+        tool_choice [::json::write string auto] \
     ]
 }
 
@@ -178,9 +213,7 @@ proc ::featherweight::tool-run-code arguments {
     }
 
     try {
-        set i [interp create]
-        set result [interp eval $i [dict get $arguments code]]
-        interp delete $i
+        set result [exec [info nameofexecutable] << [dict get $arguments code] 2>@1]
     } on error e {
         set result [list Error evaluating code: $e]
     }

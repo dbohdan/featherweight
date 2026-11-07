@@ -1,0 +1,5 @@
+/attic/
+
+*.bak*
+*.sw*
+*.log
