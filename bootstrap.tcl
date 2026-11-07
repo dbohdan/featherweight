@@ -16,10 +16,10 @@ namespace eval ::featherweight {
     variable config [dict create \
         debug true \
         \
-        apiKeyEnvVar OPENROUTER_API_KEY \
+        api_key_env_var OPENROUTER_API_KEY \
         endpoint https://openrouter.ai/api/v1/chat/completions \
         model moonshotai/kimi-k3.1-pro \
-        systemPrompt {You are an expert software developer working with a user on their code.
+        system_prompt {You are an expert software developer working with a user on their code.
 The user will ask for changes to the code, or ask questions about it.
 If a request is ambiguous, ask clarifying questions before making changes.
 
@@ -33,14 +33,14 @@ Use it as a window into the user's environment.} \
                     Tcllib is available. You receive whatever the code writes to stdout/stderr; use puts to return results.}
                 -param {code string {The code to evaluate.}}
                 -required code
-                -command ::featherweight::tool-run-code
+                -command ::featherweight::tool_run_code
             }
         }]
     ]
 }
 
 
-proc ::featherweight::get-env {name {default %UNSET%}} {
+proc ::featherweight::get_env {name {default %UNSET%}} {
     if {![info exists ::env($name)]} {
         if {$default ne {%UNSET%}} {
             return $default
@@ -53,18 +53,18 @@ proc ::featherweight::get-env {name {default %UNSET%}} {
 }
 
 
-proc ::featherweight::api-key {} {
+proc ::featherweight::api_key {} {
     variable config
 
-    return [get-env [dict get $config apiKeyEnvVar]]
+    return [get_env [dict get $config api_key_env_var]]
 }
 
 
-proc ::featherweight::json-tool args {
+proc ::featherweight::json_tool args {
     if {[llength $args] % 2 != 0
         || [lsort [dict keys $args]] ne {-command -description -name -param -required}} {
         error {wrong # args: should be\
-            "::featherweight::json-tool -command command -name name\
+            "::featherweight::json_tool -command command -name name\
             -description description ?-param param ...? ?-required required?"}
     }
 
@@ -91,13 +91,13 @@ proc ::featherweight::json-tool args {
                     error {each -param must be {name type description}}
                 }
 
-                lassign $value property type paramDescription
+                lassign $value property type param_description
 
                 if {[dict exists $properties $property]} {
                     error "duplicate parameter: $property"
                 }
 
-                dict set properties $property [list $type $paramDescription]
+                dict set properties $property [list $type $param_description]
             }
 
             default {
@@ -106,24 +106,24 @@ proc ::featherweight::json-tool args {
         }
     }
 
-    set jsonProperties {}
+    set json_properties {}
     dict for {property schema} $properties {
-        lassign $schema type paramDescription
-        lappend jsonProperties $property [::json::write object \
+        lassign $schema type param_description
+        lappend json_properties $property [::json::write object \
             type [::json::write string $type] \
-            description [::json::write string $paramDescription] \
+            description [::json::write string $param_description] \
         ]
     }
 
-    set jsonRequired {}
+    set json_required {}
     foreach property $required {
-        lappend jsonRequired [::json::write string $property]
+        lappend json_required [::json::write string $property]
     }
 
     set parameters [::json::write object \
         type [::json::write string object] \
-        properties [::json::write object {*}$jsonProperties] \
-        required   [::json::write array {*}$jsonRequired] \
+        properties [::json::write object {*}$json_properties] \
+        required   [::json::write array {*}$json_required] \
     ]
 
     return [::json::write object \
@@ -136,7 +136,7 @@ proc ::featherweight::json-tool args {
     ]
 }
 
-proc ::featherweight::json-tool-call call {
+proc ::featherweight::json_tool_call call {
     set function [dict get $call function]
 
     return [::json::write object \
@@ -149,7 +149,7 @@ proc ::featherweight::json-tool-call call {
     ]
 }
 
-proc ::featherweight::json-message message {
+proc ::featherweight::json_message message {
     set fields {}
 
     dict for {key value} $message {
@@ -157,7 +157,7 @@ proc ::featherweight::json-message message {
             set calls {}
 
             foreach call $value {
-                lappend calls [::featherweight::json-tool-call $call]
+                lappend calls [::featherweight::json_tool_call $call]
             }
 
             lappend fields tool_calls [::json::write array {*}$calls]
@@ -170,26 +170,26 @@ proc ::featherweight::json-message message {
 }
 
 
-proc ::featherweight::json-payload {model jsonTools messages} {
-    set jsonMessages [lmap message $messages {
-        ::featherweight::json-message $message
+proc ::featherweight::json_payload {model json_tools messages} {
+    set json_messages [lmap message $messages {
+        ::featherweight::json_message $message
     }]
 
     return [::json::write object \
         model [::json::write string $model] \
-        messages [::json::write array {*}$jsonMessages] \
+        messages [::json::write array {*}$json_messages] \
         reasoning [::json::write object effort [::json::write string low]] \
-        tools [::json::write array {*}$jsonTools] \
+        tools [::json::write array {*}$json_tools] \
         tool_choice [::json::write string auto] \
     ]
 }
 
 
-proc ::featherweight::tool-run-code arguments {
+proc ::featherweight::tool_run_code arguments {
     variable config
 
     if {[dict get $config debug]} {
-        debug-log tool "run_code $arguments"
+        debug_log tool "run_code $arguments"
     }
 
     try {
@@ -202,15 +202,15 @@ proc ::featherweight::tool-run-code arguments {
 }
 
 
-proc ::featherweight::call-tool toolCall {
+proc ::featherweight::call_tool tool_call {
     variable config
 
-    set id [dict get $toolCall id]
-    set type [dict get $toolCall type]
+    set id [dict get $tool_call id]
+    set type [dict get $tool_call type]
     if {$type ne {function}} {
         return [dict create role tool tool_call_id $id content "Error: unknown tool call type: [list $type]"]
     }
-    set function [dict get $toolCall function]
+    set function [dict get $tool_call function]
     set name [dict get $function name]
     set arguments [dict get $function arguments]
 
@@ -236,9 +236,9 @@ proc ::featherweight::call-tool toolCall {
 
 namespace eval ::featherweight {
     variable W {}
-    variable msgList {}
-    variable jsonTools {}
-    variable userInput {}
+    variable msg_list {}
+    variable json_tools {}
+    variable user_input {}
     variable busy 0
     variable tok {}
     variable done 0
@@ -256,7 +256,7 @@ proc ::featherweight::pretty {raw} {
 
 
 
-proc ::featherweight::debug-log {category text} {
+proc ::featherweight::debug_log {category text} {
     variable config
     variable W
     if {![dict get $config debug] && $category ni {error}} { return }
@@ -277,7 +277,7 @@ proc ::featherweight::debug-log {category text} {
 }
 
 
-proc ::featherweight::clean-assistant-message {msg} {
+proc ::featherweight::clean_assistant_message {msg} {
     set out [dict create role assistant]
     if {[dict exists $msg content]} {
         set content [dict get $msg content]
@@ -292,7 +292,7 @@ proc ::featherweight::clean-assistant-message {msg} {
 }
 
 
-proc ::featherweight::ui-append {tag text} {
+proc ::featherweight::ui_append {tag text} {
     variable W
     if {![dict exists $W chat]} { return }
     set t [dict get $W chat]
@@ -303,25 +303,25 @@ proc ::featherweight::ui-append {tag text} {
 }
 
 
-proc ::featherweight::ui-user {text} {
-    ui-append role "You\n"
-    ui-append user "$text\n\n"
+proc ::featherweight::ui_user {text} {
+    ui_append role "You\n"
+    ui_append user "$text\n\n"
 }
 
 
-proc ::featherweight::ui-assistant {text} {
-    ui-append role "Assistant\n"
-    ui-append assistant "$text\n\n"
+proc ::featherweight::ui_assistant {text} {
+    ui_append role "Assistant\n"
+    ui_append assistant "$text\n\n"
 }
 
 
-proc ::featherweight::ui-tool {text} {
-    ui-append role "Tool\n"
-    ui-append tool "$text\n\n"
+proc ::featherweight::ui_tool {text} {
+    ui_append role "Tool\n"
+    ui_append tool "$text\n\n"
 }
 
 
-proc ::featherweight::set-ui-busy {flag} {
+proc ::featherweight::set_ui_busy {flag} {
     variable W
     variable busy
     set busy $flag
@@ -340,114 +340,114 @@ proc ::featherweight::set-ui-busy {flag} {
 
 
 proc ::featherweight::submit {} {
-    variable msgList
+    variable msg_list
     variable busy
-    variable userInput
+    variable user_input
     if {$busy} { return }
-    set text [string trim $userInput]
+    set text [string trim $user_input]
     if {$text eq {}} { return }
-    set userInput {}
-    lappend msgList [dict create role user content $text]
-    ui-user $text
-    set-ui-busy 1
-    request-async
+    set user_input {}
+    lappend msg_list [dict create role user content $text]
+    ui_user $text
+    set_ui_busy 1
+    request_async
 }
 
 
 proc ::featherweight::clear {} {
     variable W
     variable config
-    variable msgList
+    variable msg_list
     variable busy
     if {$busy} { return }
-    set msgList [list [dict create role system content [dict get $config systemPrompt]]]
+    set msg_list [list [dict create role system content [dict get $config system_prompt]]]
     if {[dict exists $W chat]} {
         set chat [dict get $W chat]
         $chat configure -state normal
         $chat delete 1.0 end
         $chat configure -state disabled
     }
-    debug-log tool "conversation cleared"
+    debug_log tool "conversation cleared"
 }
 
 
-proc ::featherweight::request-async {} {
+proc ::featherweight::request_async {} {
     variable config
-    variable msgList
-    variable jsonTools
+    variable msg_list
+    variable json_tools
     variable tok
-    set payload [json-payload [dict get $config model] $jsonTools $msgList]
-    debug-log request [pretty $payload]
+    set payload [json_payload [dict get $config model] $json_tools $msg_list]
+    debug_log request [pretty $payload]
     set tok [::http::geturl [dict get $config endpoint]\
         -method POST\
         -type application/json\
-        -headers [list Authorization "Bearer [api-key]"]\
+        -headers [list Authorization "Bearer [api_key]"]\
         -query $payload\
-        -command ::featherweight::on-response]
+        -command ::featherweight::on_response]
 }
 
 
-proc ::featherweight::on-response {token} {
-    variable msgList
+proc ::featherweight::on_response {token} {
+    variable msg_list
     set status [::http::ncode $token]
     set data [::http::data $token]
     set tstatus [::http::status $token]
     catch {::http::cleanup $token}
 
     if {$tstatus ne {complete}} {
-        debug-log error "request failed: status=$tstatus"
-        set-ui-busy 0
+        debug_log error "request failed: status=$tstatus"
+        set_ui_busy 0
         return
     }
-    debug-log response "HTTP $status\n[pretty $data]"
+    debug_log response "HTTP $status\n[pretty $data]"
     if {$status != 200} {
-        debug-log error "HTTP $status: $data"
-        set-ui-busy 0
+        debug_log error "HTTP $status: $data"
+        set_ui_busy 0
         return
     }
     if {[catch {json::json2dict $data} response]} {
-        debug-log error "JSON decode failed: $response"
-        set-ui-busy 0
+        debug_log error "JSON decode failed: $response"
+        set_ui_busy 0
         return
     }
     if {![dict exists $response choices] || [llength [dict get $response choices]] == 0} {
-        debug-log error "response has no choices"
-        set-ui-busy 0
+        debug_log error "response has no choices"
+        set_ui_busy 0
         return
     }
     set choice [lindex [dict get $response choices] 0]
     if {![dict exists $choice message]} {
-        debug-log error "choice has no message"
-        set-ui-busy 0
+        debug_log error "choice has no message"
+        set_ui_busy 0
         return
     }
     set raw [dict get $choice message]
-    set cleaned [clean-assistant-message $raw]
+    set cleaned [clean_assistant_message $raw]
     if {[dict exists $cleaned content]} {
-        ui-assistant [dict get $cleaned content]
+        ui_assistant [dict get $cleaned content]
     }
-    lappend msgList $cleaned
+    lappend msg_list $cleaned
     if {[dict exists $cleaned tool_calls]} {
         foreach call [dict get $cleaned tool_calls] {
-            debug-log tool "call: $call"
-            set result [call-tool $call]
-            lappend msgList $result
-            ui-tool [dict get $result content]
+            debug_log tool "call: $call"
+            set result [call_tool $call]
+            lappend msg_list $result
+            ui_tool [dict get $result content]
         }
-        request-async
+        request_async
         return
     }
-    set-ui-busy 0
+    set_ui_busy 0
 }
 
 
-proc ::featherweight::on-close {} {
+proc ::featherweight::on_close {} {
     variable done
     set done 1
 }
 
 
-proc ::featherweight::build-ui {} {
+proc ::featherweight::build_ui {} {
     variable W
     variable config
 
@@ -456,7 +456,7 @@ proc ::featherweight::build-ui {} {
     wm title . "Featherweight - [dict get $config model]"
     wm minsize . 640 420
     wm geometry . 900x650
-    wm protocol . WM_DELETE_WINDOW ::featherweight::on-close
+    wm protocol . WM_DELETE_WINDOW ::featherweight::on_close
 
     ttk::frame .root -padding {6 6 6 6}
     pack .root -fill both -expand 1
@@ -493,7 +493,7 @@ proc ::featherweight::build-ui {} {
 
     ttk::frame .root.input
     pack .root.input -fill x -pady {6 0}
-    ttk::entry .root.input.e -textvariable ::featherweight::userInput
+    ttk::entry .root.input.e -textvariable ::featherweight::user_input
     ttk::button .root.input.clear -text "Clear" -command ::featherweight::clear
     ttk::button .root.input.send -text "Send" -command ::featherweight::submit
     pack .root.input.send -side right -padx {4 0}
@@ -513,8 +513,8 @@ proc ::featherweight::build-ui {} {
         status .root.status]
 
     set chat [dict get $W chat]
-    font create ::featherweight::roleFont  {*}[font configure TkTextFont]  -weight bold
-    $chat tag configure role -font ::featherweight::roleFont -foreground #555555
+    font create ::featherweight::role_font  {*}[font configure TkTextFont]  -weight bold
+    $chat tag configure role -font ::featherweight::role_font -foreground #555555
     $chat tag configure user -foreground #0b57d0
     $chat tag configure assistant -foreground #1b5e20
     $chat tag configure tool -foreground #6a1b9a
@@ -532,39 +532,39 @@ proc ::featherweight::build-ui {} {
 
 
 
-proc ::featherweight::console-main {} {
+proc ::featherweight::console_main {} {
     variable config
-    variable msgList
-    variable jsonTools
+    variable msg_list
+    variable json_tools
     ::tls::init -tls1 1
     ::autoproxy::init
     ::http::register https 443 autoproxy::tls_socket
-    set jsonTools [lmap toolArgs [dict values [dict get $config tools]] {
-        json-tool {*}$toolArgs
+    set json_tools [lmap tool_args [dict values [dict get $config tools]] {
+        json_tool {*}$tool_args
     }]
-    set msgList [list [dict create role system content [dict get $config systemPrompt]]]
+    set msg_list [list [dict create role system content [dict get $config system_prompt]]]
     puts "featherweight console mode (type a message; Ctrl-D to exit)"
     while {[gets stdin line] >= 0} {
         if {[string trim $line] eq {}} { continue }
-        lappend msgList [dict create role user content $line]
-        console-turn
+        lappend msg_list [dict create role user content $line]
+        console_turn
     }
 }
 
 
-proc ::featherweight::console-turn {} {
+proc ::featherweight::console_turn {} {
     variable config
-    variable msgList
-    variable jsonTools
+    variable msg_list
+    variable json_tools
     variable tok
     while 1 {
-        set payload [json-payload [dict get $config model] $jsonTools $msgList]
-        debug-log request [pretty $payload]
+        set payload [json_payload [dict get $config model] $json_tools $msg_list]
+        debug_log request [pretty $payload]
         if {[catch {
             set tok [::http::geturl [dict get $config endpoint]\
                 -method POST\
                 -type application/json\
-                -headers [list Authorization "Bearer [api-key]"]\
+                -headers [list Authorization "Bearer [api_key]"]\
                 -query $payload]
             set status [::http::ncode $tok]
             set data [::http::data $tok]
@@ -575,7 +575,7 @@ proc ::featherweight::console-turn {} {
         catch {::http::cleanup $tok}
         if {$status != 200} {
             puts "Error: HTTP $status"
-            debug-log error "HTTP $status: $data"
+            debug_log error "HTTP $status: $data"
             return
         }
         if {[catch {json::json2dict $data} response]} {
@@ -587,17 +587,17 @@ proc ::featherweight::console-turn {} {
             return
         }
         set choice [lindex [dict get $response choices] 0]
-        set cleaned [clean-assistant-message [dict get $choice message]]
+        set cleaned [clean_assistant_message [dict get $choice message]]
         if {[dict exists $cleaned content]} {
             puts "Assistant: [dict get $cleaned content]"
         }
-        lappend msgList $cleaned
+        lappend msg_list $cleaned
         if {![dict exists $cleaned tool_calls]} { return }
         foreach call [dict get $cleaned tool_calls] {
-            debug-log tool "call: $call"
-            set result [call-tool $call]
+            debug_log tool "call: $call"
+            set result [call_tool $call]
             puts "Tool: [dict get $result content]"
-            lappend msgList $result
+            lappend msg_list $result
         }
     }
 }
@@ -605,13 +605,13 @@ proc ::featherweight::console-turn {} {
 
 proc ::featherweight::main {argv0 argv} {
     variable config
-    variable msgList
-    variable jsonTools
+    variable msg_list
+    variable json_tools
     variable done
 
     if {[catch {package require Tk} err]} {
         puts "Tk/display unavailable ($err); falling back to console mode."
-        console-main
+        console_main
         return
     }
 
@@ -619,21 +619,21 @@ proc ::featherweight::main {argv0 argv} {
     ::autoproxy::init
     ::http::register https 443 autoproxy::tls_socket
 
-    set jsonTools [lmap toolArgs [dict values [dict get $config tools]] {
-        json-tool {*}$toolArgs
+    set json_tools [lmap tool_args [dict values [dict get $config tools]] {
+        json_tool {*}$tool_args
     }]
 
-    set msgList [list [dict create role system content [dict get $config systemPrompt]]]
+    set msg_list [list [dict create role system content [dict get $config system_prompt]]]
 
-    if {[catch {build-ui} err]} {
+    if {[catch {build_ui} err]} {
         puts "Could not create UI ($err); falling back to console mode."
         catch {destroy .}
-        console-main
+        console_main
         return
     }
 
-    debug-log tool "model: [dict get $config model]"
-    debug-log tool "endpoint: [dict get $config endpoint]"
+    debug_log tool "model: [dict get $config model]"
+    debug_log tool "endpoint: [dict get $config endpoint]"
 
     vwait ::featherweight::done
     catch {destroy .}
