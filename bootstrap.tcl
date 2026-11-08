@@ -2,6 +2,7 @@
 
 package require Tcl 8.6 9
 
+package require fileutil
 package require json
 package require json::write
 
@@ -24,39 +25,44 @@ You have one tool available: run_code.
 Use it as a window into the user's environment.} \
         \
         messages {} \
-        tools [subst {
-            run_code {
-                -name run_code
-                -description {Evaluate code in a stateful Tcl [info patchlevel] interp that the harness runs in.\
-                    State persists between calls.\
-                    Tcllib is available.\
-                    You receive whatever the code writes to stdout/stderr; use puts to return results.}
-                -param {code string {The code to evaluate.}}
-                -required code
-                -command ::featherweight::tool_run_code
-            }
-        }]
     ]
 
     variable run_code_output {}
+    variable tools_available [subst {
+        run_code {
+            -name run_code
+            -description {Evaluate code in a stateful Tcl [info patchlevel] interp that the harness runs in.\
+                State persists between calls.\
+                Tcllib is available.\
+                You receive the return value plus whatever the code writes to stdout/stderr.}
+            -param {code string {The code to evaluate.}}
+            -required code
+            -command ::featherweight::tool_run_code
+        }
+    }]
 }
 
 
 proc ::featherweight::config_path {} {
-    return [file join [pwd] config.tcl]
+    return [file join [pwd] featherweight.conf]
 }
 
 
-proc ::featherweight::load_config {} {
+proc ::featherweight::init_config {} {
     variable config
 
     set path [config_path]
     if {![file exists $path]} {
-        dict set config messages [list  [dict create role system content [dict get $config system_prompt]]]
+        dict set config messages [list \
+            [dict create \
+                role system \
+                content [dict get $config system_prompt] \
+            ] \
+        ]
         return
     }
 
-    if {[catch {source $path} loaded options]} {
+    if {[catch {::fileutil::cat -encoding utf-8 $path} loaded options]} {
         error "could not load [list $path]: $loaded" {} [dict get $options -errorinfo]
     }
     if {[catch {dict size $loaded}]} {
@@ -75,10 +81,25 @@ proc ::featherweight::save_config {} {
 
     set path [config_path]
     set temporary "$path.[pid].tmp"
+
     if {[catch {
         set channel [open $temporary w]
         fconfigure $channel -encoding utf-8
-        ::puts $channel [list return $config]
+
+        dict for {key value} $config {
+            if {$key eq {messages}} {
+                ::puts $channel "$key {"
+
+                foreach message $value {
+                    ::puts $channel "    [list $message]"
+                }
+
+                ::puts $channel "}"
+            } else {
+                ::puts $channel [list $key $value]
+            }
+        }
+
         close $channel
         file rename -force $temporary $path
     } error]} {
@@ -301,21 +322,30 @@ proc ::featherweight::tool_run_code arguments {
 
 proc ::featherweight::call_tool tool_call {
     variable config
+    variable tools_available
 
     set id [dict get $tool_call id]
     set type [dict get $tool_call type]
     if {$type ne {function}} {
-        return [dict create role tool tool_call_id $id content "Error: unknown tool call type: [list $type]"]
+        return [dict create \
+            role tool \
+            tool_call_id $id \
+            content "Error: unknown tool call type: [list $type]" \
+        ]
     }
     set function [dict get $tool_call function]
     set name [dict get $function name]
     set arguments [dict get $function arguments]
 
-    if {![dict exists [dict get $config tools] $name]} {
-        return [dict create role tool tool_call_id $id content "Error: unknown tool name: [list $name]"]
+    if {![dict exists $tools_available $name]} {
+        return [dict create \
+            role tool \
+            tool_call_id $id \
+            content "Error: unknown tool name: [list $name]" \
+        ]
     }
 
-    set command [dict get $config tools $name -command]
+    set command [dict get $tools_available $name -command]
     if {[catch {
         set result [{*}$command [::json::json2dict $arguments]]
     } result]} {
@@ -709,8 +739,9 @@ proc ::featherweight::build_ui {} {
 proc ::featherweight::console_main {} {
     variable config
     variable json_tools
+    variable tools_available
 
-    set json_tools [lmap tool_args [dict values [dict get $config tools]] {
+    set json_tools [lmap tool_args [dict values $tools_available]] {
         json_tool {*}$tool_args
     }]
     ::puts "Featherweight console mode (type a message; Ctrl-D to exit)"
@@ -774,10 +805,11 @@ proc ::featherweight::console_turn {} {
 
 proc ::featherweight::main {argv0 argv} {
     variable config
-    variable json_tools
     variable done
+    variable json_tools
+    variable tools_available
 
-    load_config
+    init_config
 
     if {[catch {package require Tk} err]} {
         ::puts "Tk/display unavailable ($err); falling back to console mode."
@@ -785,7 +817,7 @@ proc ::featherweight::main {argv0 argv} {
         return
     }
 
-    set json_tools [lmap tool_args [dict values [dict get $config tools]] {
+    set json_tools [lmap tool_args [dict values $tools_available] {
         json_tool {*}$tool_args
     }]
 
