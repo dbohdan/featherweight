@@ -2,10 +2,8 @@
 
 package require Tcl 8.6 9
 
-package require http
 package require json
 package require json::write
-package require tls 1.7
 
 
 namespace eval ::featherweight {
@@ -39,89 +37,6 @@ Use it as a window into the user's environment.} \
 
     variable code_interp {}
     variable code_output {}
-
-    variable proxy_host {}
-    variable proxy_port {}
-}
-
-proc ::featherweight::configure_proxy {} {
-    variable proxy_host
-    variable proxy_port
-
-    ::http::register https 443 ::featherweight::tls_socket
-
-    set proxy {}
-    foreach name {http_proxy HTTP_PROXY} {
-        if {[info exists ::env($name)] && $::env($name) ne {}} {
-            set proxy $::env($name)
-            break
-        }
-    }
-
-    if {$proxy eq {}} {
-        set proxy_host {}
-        set proxy_port {}
-        ::http::config -proxyhost {} -proxyport {}
-        return
-    }
-
-    if {![regexp {^(?:http://)?(?:[^/@]+@)?([^/:]+)(?::([0-9]+))?/?$}  $proxy -> host port]} {
-        error "unsupported http_proxy value: [list $proxy]"
-    }
-    if {$port eq {}} {
-        set port 80
-    }
-
-    set proxy_host $host
-    set proxy_port $port
-    ::http::config -proxyhost $host -proxyport $port
-}
-
-
-proc ::featherweight::tls_socket args {
-    variable proxy_host
-    variable proxy_port
-
-    # http::geturl passes the proxy address when proxying. Recover the real
-    # destination from its stack frame so we can tunnel to it instead.
-    upvar host destination_host
-    upvar port destination_port
-    set args [lrange $args 0 end-2]
-
-    if {$proxy_host eq {}} {
-        return [::tls::socket -servername $destination_host  {*}$args $destination_host $destination_port]
-    }
-
-    set sock [::socket $proxy_host $proxy_port]
-    if {[catch {
-        fconfigure $sock -blocking 1 -buffering none -translation binary
-        puts -nonewline $sock  "CONNECT $destination_host:$destination_port HTTP/1.1\r\nHost: $destination_host:$destination_port\r\n\r\n"
-
-        if {[gets $sock line] < 0} {
-            error "proxy closed the connection during CONNECT"
-        }
-        if {![regexp {^HTTP/[0-9.]+[ \t]+([0-9]+)} $line -> status]
-            || $status < 200 || $status >= 300} {
-            error "proxy CONNECT failed: [string trim $line]"
-        }
-
-        # Consume the remaining CONNECT response headers.
-        while {[gets $sock line] >= 0} {
-            if {[string trim $line] eq {}} { break }
-        }
-
-        if {{async} ni $args} {
-            set tls_args [lrange $args 0 end-2]
-        } else {
-            set tls_args $args
-        }
-        set sock [::tls::import $sock {*}$tls_args  -servername $destination_host]
-    } err]} {
-        catch {close $sock}
-        return -code error $err
-    }
-
-    return $sock
 }
 
 
@@ -507,61 +422,118 @@ proc ::featherweight::clear {} {
 
 proc ::featherweight::request_async {} {
     variable config
-    variable msg_list
+    variable curl_data
     variable json_tools
-    variable tok
+    variable msg_list
+
     set payload [json_payload [dict get $config model] $json_tools $msg_list]
     debug_log request [pretty $payload]
-    set tok [::http::geturl [dict get $config endpoint]\
-        -method POST\
-        -type application/json\
-        -headers [list Authorization "Bearer [api_key]"]\
-        -query $payload\
-        -command ::featherweight::on_response]
+
+    set curl_data(ch) {}
+    set ch [open |[list curl \
+        --data-raw $payload \
+        --header "Authorization: Bearer [api_key]" \
+        --header {Content-Type: application/json} \
+        --request POST \
+        --show-error \
+        --silent \
+        --write-out "\n%{http_code} %{exitcode} %{errormsg}" \
+        [dict get $config endpoint] \
+    ]]
+
+    fconfigure $ch -blocking 0
+    fileevent $ch readable [list [namespace current]::request_readable $ch]
 }
 
 
-proc ::featherweight::on_response {token} {
+proc ::featherweight::request_readable ch {
     variable msg_list
-    set status [::http::ncode $token]
-    set data [::http::data $token]
-    set tstatus [::http::status $token]
-    set error [::http::error $token]
-    catch {::http::cleanup $token}
+    variable curl_data
 
-    if {$tstatus ni {ok complete}} {
-        debug_log error "request failed: status=$tstatus error=$error"
+    # Accumulate available output.
+    # Wait for EOF before parsing the response.
+    append curl_data($ch) [read $ch]
+    if {![eof $ch]} {
+        return
+    }
+
+    fileevent $ch readable {}
+    set output $curl_data($ch)
+    unset curl_data($ch)
+
+    if {[catch {close $ch} error options]} {
+        debug_log error "curl request failed: $error"
         set_ui_busy 0
         return
     }
+
+    # Separate the status appended by --write-out from the response body.
+    set marker [string last "\n" $output]
+    if {$marker < 0} {
+        debug_log error {curl response did not include an HTTP status}
+        set_ui_busy 0
+        return
+    }
+
+    set metadata [string range $output [expr {$marker + 1}] end]
+    set error_msg [lassign $metadata status exit_code]
+
+    if {![string is integer -strict $status]} {
+        debug_log error "invalid HTTP status from curl: $status"
+        set_ui_busy 0
+        return
+    }
+
+    if {![string is integer -strict $exit_code]} {
+        debug_log error "invalid exit code from curl: $exit_code"
+        set_ui_busy 0
+        return
+    }
+
+    if {$exit_code != 0} {
+        debug_log error "curl ($exit_code): $error_msg"
+        set_ui_busy 0
+        return
+    }
+
+    set data [string range $output 0 [expr {$marker - 1}]]
+
     debug_log response "HTTP $status\n[pretty $data]"
+
     if {$status != 200} {
         debug_log error "HTTP $status: $data"
         set_ui_busy 0
         return
     }
+
     if {[catch {json::json2dict $data} response]} {
         debug_log error "JSON decode failed: $response"
         set_ui_busy 0
         return
     }
+
     if {![dict exists $response choices] || [llength [dict get $response choices]] == 0} {
-        debug_log error "response has no choices"
+        debug_log error {response has no choices}
         set_ui_busy 0
         return
     }
+
     set choice [lindex [dict get $response choices] 0]
     if {![dict exists $choice message]} {
         debug_log error "choice has no message"
         set_ui_busy 0
         return
     }
+
     set raw [dict get $choice message]
     set cleaned [clean_assistant_message $raw]
+
     if {[dict exists $cleaned content]} {
         ui_assistant [dict get $cleaned content]
     }
+
     lappend msg_list $cleaned
+
     if {[dict exists $cleaned tool_calls]} {
         foreach call [dict get $cleaned tool_calls] {
             debug_log tool "call: $call"
@@ -572,6 +544,7 @@ proc ::featherweight::on_response {token} {
         request_async
         return
     }
+
     set_ui_busy 0
 }
 
@@ -671,8 +644,7 @@ proc ::featherweight::console_main {} {
     variable config
     variable msg_list
     variable json_tools
-    ::tls::init -tls1 1
-    configure_proxy
+
     set json_tools [lmap tool_args [dict values [dict get $config tools]] {
         json_tool {*}$tool_args
     }]
@@ -748,9 +720,6 @@ proc ::featherweight::main {argv0 argv} {
         console_main
         return
     }
-
-    ::tls::init -tls1 1
-    configure_proxy
 
     set json_tools [lmap tool_args [dict values [dict get $config tools]] {
         json_tool {*}$tool_args
