@@ -10,7 +10,7 @@ package require json::write
 namespace eval ::featherweight {
     variable version 0.0.0
 
-    # Configuration is embedded.
+    # Default configuration and state.
     variable config [dict create \
         debug true \
         \
@@ -24,7 +24,8 @@ If a request is ambiguous, ask clarifying questions before making changes.
 You have one tool available: run_code.
 Use it as a window into the user's environment.} \
         \
-        messages {} \
+        current_session default \
+        sessions {default {}} \
     ]
 
     variable run_code_output {}
@@ -52,27 +53,34 @@ proc ::featherweight::init_config {} {
     variable config
 
     set path [config_path]
-    if {![file exists $path]} {
-        dict set config messages [list \
-            [dict create \
-                role system \
-                content [dict get $config system_prompt] \
-            ] \
-        ]
-        return
+    if {[file exists $path]} {
+        if {[catch {::fileutil::cat -encoding utf-8 $path} loaded options]} {
+            error "could not load [list $path]: $loaded" {} [dict get $options -errorinfo]
+        }
+        if {[catch {dict size $loaded}]} {
+            error "configuration in [list $path] is not a Tcl dict"
+        }
+        set config $loaded
     }
 
-    if {[catch {::fileutil::cat -encoding utf-8 $path} loaded options]} {
-        error "could not load [list $path]: $loaded" {} [dict get $options -errorinfo]
+    set system_message [dict create role system content [dict get $config system_prompt]]
+    if {![dict exists $config sessions] || [dict size [dict get $config sessions]] == 0} {
+        dict set config sessions default [list $system_message]
     }
-    if {[catch {dict size $loaded}]} {
-        error "configuration in [list $path] is not a Tcl dict"
+    if {![dict exists $config current_session]
+            || ![dict exists $config sessions [dict get $config current_session]]} {
+        dict set config current_session default
     }
+    if {[llength [current_messages]] == 0} {
+        dict set config sessions [dict get $config current_session] [list $system_message]
+    }
+    save_config
+}
 
-    set config $loaded
-    if {![dict exists $config messages] || [llength [dict get $config messages]] == 0} {
-        dict set config messages [list  [dict create role system content [dict get $config system_prompt]]]
-    }
+
+proc ::featherweight::current_messages {} {
+    variable config
+    return [dict get $config sessions [dict get $config current_session]]
 }
 
 
@@ -87,13 +95,15 @@ proc ::featherweight::save_config {} {
         fconfigure $channel -encoding utf-8
 
         dict for {key value} $config {
-            if {$key eq {messages}} {
-                ::puts $channel "$key {"
-
-                foreach message $value {
-                    ::puts $channel "    [list $message]"
+            if {$key eq {sessions}} {
+                ::puts $channel "sessions {"
+                dict for {name messages} $value {
+                    ::puts $channel "    [list $name] {"
+                    foreach message $messages {
+                        ::puts $channel "        [list $message]"
+                    }
+                    ::puts $channel "    }"
                 }
-
                 ::puts $channel "}"
             } else {
                 ::puts $channel [list $key $value]
@@ -113,10 +123,12 @@ proc ::featherweight::save_config {} {
 proc ::featherweight::append_message message {
     variable config
 
-    dict lappend config messages $message
+    set sessions [dict get $config sessions]
+    dict lappend sessions [dict get $config current_session] $message
+    dict set config sessions $sessions
+
     save_config
 }
-
 
 
 proc ::featherweight::get_env {name {default %UNSET%}} {
@@ -467,7 +479,7 @@ proc ::featherweight::replay_messages {} {
     variable config
 
     set pending_tool_calls {}
-    foreach message [dict get $config messages] {
+    foreach message [current_messages] {
         switch -- [dict get $message role] {
             user {
                 ui_user [dict get $message content]
@@ -555,10 +567,108 @@ proc ::featherweight::submit {} {
     set text [string trim [$entry get 1.0 end-1c]]
     if {$text eq {}} { return }
     $entry delete 1.0 end
+    if {[handle_slash_command $text]} { return }
     append_message [dict create role user content $text]
     ui_user $text
     set_ui_busy 1
     request_async
+}
+
+
+proc ::featherweight::update_window_title {} {
+    variable config
+    variable W
+    if {![dict exists $W chat]} { return }
+    wm title . "Featherweight - [dict get $config model] - [dict get $config current_session]"
+}
+
+
+proc ::featherweight::refresh_session {} {
+    variable W
+    if {![dict exists $W chat]} { return }
+    set chat [dict get $W chat]
+    $chat configure -state normal
+    $chat delete 1.0 end
+    $chat configure -state disabled
+    replay_messages
+    update_window_title
+}
+
+
+proc ::featherweight::switch_session name {
+    variable config
+
+    if {$name eq {}} {
+        error {session name cannot be empty}
+    }
+    if {![dict exists $config sessions $name]} {
+        dict set config sessions $name [list \
+            [dict create \
+                role system \
+                content [dict get $config system_prompt] \
+            ] \
+        ]
+    }
+    dict set config current_session $name
+    save_config
+    refresh_session
+}
+
+
+proc ::featherweight::handle_slash_command text {
+    variable config
+    variable W
+
+    if {[string index $text 0] ne {/}} { return 0 }
+    if {[regexp {^/([^[:space:]]+)(?:[[:space:]]+(.*))?$} $text -> command arguments]} {
+        set command [string tolower $command]
+    } else {
+        return 0
+    }
+
+    switch -- $command {
+        model {
+            set model [string trim $arguments]
+            if {$model eq {}} {
+                debug_log tool "current model: [dict get $config model]"
+                return 1
+            }
+            dict set config model $model
+            save_config
+            update_window_title
+            debug_log tool "model set to $model"
+        }
+        eval {
+            if {[string trim $arguments] eq {}} {
+                debug_log error {usage: /eval Tcl-code}
+                return 1
+            }
+            # Use the same evaluator and output format as the run_code tool.
+            debug_log eval "/eval $arguments"
+            debug_log eval [tool_run_code [dict create code $arguments]]
+        }
+        session {
+            set name [string trim $arguments]
+            if {$name eq {}} {
+                set names [lsort [dict keys [dict get $config sessions]]]
+                debug_log tool "current session: [dict get $config current_session]; sessions: $names"
+                return 1
+            }
+            if {[llength $name] != 1} {
+                debug_log error {usage: /session ?name?}
+                return 1
+            }
+            if {[catch {switch_session $name} error]} {
+                debug_log error "could not switch session: $error"
+                return 1
+            }
+            debug_log tool "switched to session $name"
+        }
+        default {
+            debug_log error "unknown command: /$command"
+        }
+    }
+    return 1
 }
 
 
@@ -570,7 +680,7 @@ proc ::featherweight::request_async {} {
     variable request_channels
 
     if {!$busy} { return }
-    set payload [json_payload [dict get $config model] $json_tools [dict get $config messages]]
+    set payload [json_payload [dict get $config model] $json_tools [current_messages]]
     debug_log request [pretty $payload]
 
     if {[catch {
@@ -806,7 +916,7 @@ proc ::featherweight::build_ui {} {
 
     catch {ttk::style theme use clam}
 
-    wm title . "Featherweight - [dict get $config model]"
+    update_window_title
     wm minsize . 640 420
     wm geometry . 900x650
     wm protocol . WM_DELETE_WINDOW ::featherweight::on_close
@@ -897,6 +1007,7 @@ proc ::featherweight::console_main {} {
     ::puts "Featherweight console mode (type a message; Ctrl-D to exit)"
     while {[gets stdin line] >= 0} {
         if {[string trim $line] eq {}} { continue }
+        if {[handle_slash_command $line]} { continue }
         append_message [dict create role user content $line]
         console_turn
     }
@@ -908,7 +1019,7 @@ proc ::featherweight::console_turn {} {
     variable json_tools
     variable tok
     while 1 {
-        set payload [json_payload [dict get $config model] $json_tools [dict get $config messages]]
+        set payload [json_payload [dict get $config model] $json_tools [current_messages]]
         debug_log request [pretty $payload]
         if {[catch {
             set tok [::http::geturl [dict get $config endpoint]\
