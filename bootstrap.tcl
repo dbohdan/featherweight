@@ -23,6 +23,7 @@ If a request is ambiguous, ask clarifying questions before making changes.
 You have one tool available: run_code.
 Use it as a window into the user's environment.} \
         \
+        messages {} \
         tools [subst {
             run_code {
                 -name run_code
@@ -39,6 +40,62 @@ Use it as a window into the user's environment.} \
 
     variable run_code_output {}
 }
+
+
+proc ::featherweight::config_path {} {
+    return [file join [pwd] config.tcl]
+}
+
+
+proc ::featherweight::load_config {} {
+    variable config
+
+    set path [config_path]
+    if {![file exists $path]} {
+        dict set config messages [list  [dict create role system content [dict get $config system_prompt]]]
+        return
+    }
+
+    if {[catch {source $path} loaded options]} {
+        error "could not load [list $path]: $loaded" {} [dict get $options -errorinfo]
+    }
+    if {[catch {dict size $loaded}]} {
+        error "configuration in [list $path] is not a Tcl dict"
+    }
+
+    set config $loaded
+    if {![dict exists $config messages] || [llength [dict get $config messages]] == 0} {
+        dict set config messages [list  [dict create role system content [dict get $config system_prompt]]]
+    }
+}
+
+
+proc ::featherweight::save_config {} {
+    variable config
+
+    set path [config_path]
+    set temporary "$path.[pid].tmp"
+    if {[catch {
+        set channel [open $temporary w]
+        fconfigure $channel -encoding utf-8
+        ::puts $channel [list return $config]
+        close $channel
+        file rename -force $temporary $path
+    } error]} {
+        catch {close $channel}
+        catch {file delete -force $temporary}
+        debug_log error "could not save [list $path]: $error"
+    }
+}
+
+
+proc ::featherweight::append_message message {
+    variable config
+
+    dict lappend config messages $message
+    save_config
+}
+
 
 
 proc ::featherweight::get_env {name {default %UNSET%}} {
@@ -276,7 +333,6 @@ proc ::featherweight::call_tool tool_call {
 
 namespace eval ::featherweight {
     variable W {}
-    variable msg_list {}
     variable json_tools {}
     variable user_input {}
     variable busy 0
@@ -361,6 +417,27 @@ proc ::featherweight::ui_tool {text} {
 }
 
 
+proc ::featherweight::replay_messages {} {
+    variable config
+
+    foreach message [dict get $config messages] {
+        switch -- [dict get $message role] {
+            user {
+                ui_user [dict get $message content]
+            }
+            assistant {
+                if {[dict exists $message content]} {
+                    ui_assistant [dict get $message content]
+                }
+            }
+            tool {
+                ui_tool [dict get $message content]
+            }
+        }
+    }
+}
+
+
 proc ::featherweight::set_ui_busy {flag} {
     variable W
     variable busy
@@ -380,14 +457,13 @@ proc ::featherweight::set_ui_busy {flag} {
 
 
 proc ::featherweight::submit {} {
-    variable msg_list
     variable busy
     variable user_input
     if {$busy} { return }
     set text [string trim $user_input]
     if {$text eq {}} { return }
     set user_input {}
-    lappend msg_list [dict create role user content $text]
+    append_message [dict create role user content $text]
     ui_user $text
     set_ui_busy 1
     request_async
@@ -397,10 +473,11 @@ proc ::featherweight::submit {} {
 proc ::featherweight::clear {} {
     variable W
     variable config
-    variable msg_list
     variable busy
     if {$busy} { return }
-    set msg_list [list [dict create role system content [dict get $config system_prompt]]]
+    dict set config messages [list \
+        [dict create role system content [dict get $config system_prompt]]]
+    save_config
     if {[dict exists $W chat]} {
         set chat [dict get $W chat]
         $chat configure -state normal
@@ -415,9 +492,8 @@ proc ::featherweight::request_async {} {
     variable config
     variable curl_data
     variable json_tools
-    variable msg_list
 
-    set payload [json_payload [dict get $config model] $json_tools $msg_list]
+    set payload [json_payload [dict get $config model] $json_tools [dict get $config messages]]
     debug_log request [pretty $payload]
 
     set curl_data(ch) {}
@@ -438,7 +514,6 @@ proc ::featherweight::request_async {} {
 
 
 proc ::featherweight::request_readable ch {
-    variable msg_list
     variable curl_data
 
     # Accumulate available output.
@@ -523,13 +598,13 @@ proc ::featherweight::request_readable ch {
         ui_assistant [dict get $cleaned content]
     }
 
-    lappend msg_list $cleaned
+    append_message $cleaned
 
     if {[dict exists $cleaned tool_calls]} {
         foreach call [dict get $cleaned tool_calls] {
             debug_log tool "call: $call"
             set result [call_tool $call]
-            lappend msg_list $result
+            append_message $result
             ui_tool [dict get $result content]
         }
         request_async
@@ -633,17 +708,15 @@ proc ::featherweight::build_ui {} {
 
 proc ::featherweight::console_main {} {
     variable config
-    variable msg_list
     variable json_tools
 
     set json_tools [lmap tool_args [dict values [dict get $config tools]] {
         json_tool {*}$tool_args
     }]
-    set msg_list [list [dict create role system content [dict get $config system_prompt]]]
     ::puts "Featherweight console mode (type a message; Ctrl-D to exit)"
     while {[gets stdin line] >= 0} {
         if {[string trim $line] eq {}} { continue }
-        lappend msg_list [dict create role user content $line]
+        append_message [dict create role user content $line]
         console_turn
     }
 }
@@ -651,11 +724,10 @@ proc ::featherweight::console_main {} {
 
 proc ::featherweight::console_turn {} {
     variable config
-    variable msg_list
     variable json_tools
     variable tok
     while 1 {
-        set payload [json_payload [dict get $config model] $json_tools $msg_list]
+        set payload [json_payload [dict get $config model] $json_tools [dict get $config messages]]
         debug_log request [pretty $payload]
         if {[catch {
             set tok [::http::geturl [dict get $config endpoint]\
@@ -688,13 +760,13 @@ proc ::featherweight::console_turn {} {
         if {[dict exists $cleaned content]} {
             ::puts "Assistant: [dict get $cleaned content]"
         }
-        lappend msg_list $cleaned
+        append_message $cleaned
         if {![dict exists $cleaned tool_calls]} { return }
         foreach call [dict get $cleaned tool_calls] {
             debug_log tool "call: $call"
             set result [call_tool $call]
             ::puts "Tool: [dict get $result content]"
-            lappend msg_list $result
+            append_message $result
         }
     }
 }
@@ -702,9 +774,10 @@ proc ::featherweight::console_turn {} {
 
 proc ::featherweight::main {argv0 argv} {
     variable config
-    variable msg_list
     variable json_tools
     variable done
+
+    load_config
 
     if {[catch {package require Tk} err]} {
         ::puts "Tk/display unavailable ($err); falling back to console mode."
@@ -716,8 +789,6 @@ proc ::featherweight::main {argv0 argv} {
         json_tool {*}$tool_args
     }]
 
-    set msg_list [list [dict create role system content [dict get $config system_prompt]]]
-
     if {[catch {build_ui} err]} {
         ::puts "Could not create UI ($err); falling back to console mode."
         catch {destroy .}
@@ -725,6 +796,7 @@ proc ::featherweight::main {argv0 argv} {
         return
     }
 
+    replay_messages
     debug_log tool "model: [dict get $config model]"
     debug_log tool "endpoint: [dict get $config endpoint]"
 

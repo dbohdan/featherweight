@@ -1,3 +1,9 @@
+## 2026-11-08 — Kimi K3.1 Pro
+- Added persistence of the complete configuration, including `messages`, to `config.tcl` in the launch directory.
+- Loads and restores saved conversations at startup, replays user/assistant/tool messages in the GUI, saves after every appended message and tool result, and persists Clear.
+- Writes through a PID-specific temporary file followed by an atomic rename. Save errors are logged without discarding the in-memory turn.
+- Headless tests pass for exact round trips, special characters and multiline content, tool calls, JSON serialization, Clear, replay logic, and compilation of all application procedures. No live Tk UI or API test was run.
+
 ## 2026-11-08 - DeepSeek V4.1 Flash 1017
 - Changed the GUI curl request to pass its JSON payload through stdin using Tcl's `<<` redirection and `--data-binary @-`, avoiding command-line length limits.
 - Validated with a local HTTP echo server using a 1.38 MB payload. Tcl syntax and procedure compilation checks pass. No live OpenRouter or Tk test was run.
