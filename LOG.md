@@ -1,3 +1,12 @@
+## 2026-11-08 - Kimi K3.1 Pro
+- Replaced per-call `exec` with a lazily created, persistent Tcl interpreter using `interp create`.
+- Variables, procedures, loaded packages, and working-directory changes now persist between calls.
+- Preserved stdout/stderr capture and file-channel writes.
+- Preserved output produced before evaluation errors.
+- Updated the tool description from "stateless" to "stateful".
+
+Tests pass for persistence, errors, `exec`, package loading, and file I/O. `git diff --check` is clean.
+
 ## 2026-11-07 - Kimi K3.1 Pro
 - Converted project-defined lowerCamelCase and kebab-case identifiers to snake_case,
   including procedures, namespace/local variables, and configuration keys.

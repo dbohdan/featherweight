@@ -28,7 +28,7 @@ Use it as a window into the user's environment.} \
         tools [subst {
             run_code {
                 -name run_code
-                -description {Evaluate code in a stateless Tcl [info patchlevel] interp.\
+                -description {Evaluate code in a stateful Tcl [info patchlevel] interp that persists between calls.\
                     Tcllib is available. You receive whatever the code writes to stdout/stderr; use puts to return results.}
                 -param {code string {The code to evaluate.}}
                 -required code
@@ -36,12 +36,10 @@ Use it as a window into the user's environment.} \
             }
         }]
     ]
-}
 
+    variable code_interp {}
+    variable code_output {}
 
-
-
-namespace eval ::featherweight {
     variable proxy_host {}
     variable proxy_port {}
 }
@@ -272,17 +270,66 @@ proc ::featherweight::json_payload {model json_tools messages} {
 }
 
 
+proc ::featherweight::interp_puts {interp args} {
+    variable code_output
+
+    set nonewline [expr {[lindex $args 0] eq {-nonewline}}]
+    if {$nonewline} {
+        set args [lrange $args 1 end]
+    }
+
+    switch -- [llength $args] {
+        1 {
+            set channel stdout
+            set text [lindex $args 0]
+        }
+        2 {
+            lassign $args channel text
+        }
+        default {
+            return -code error {wrong # args: should be "puts ?-nonewline? ?channelId? string"}
+        }
+    }
+
+    if {$channel ni {stdout stderr}} {
+        set forwarded [expr {$nonewline ? [linsert $args 0 -nonewline] : $args}]
+        tailcall interp eval $interp ::__featherweight_puts {*}$forwarded
+    }
+    append code_output $text [expr {$nonewline ? {} : "\n"}]
+    return
+}
+
+
+proc ::featherweight::get_code_interp {} {
+    variable code_interp
+
+    if {$code_interp eq {} || ![interp exists $code_interp]} {
+        set code_interp [interp create]
+        $code_interp eval {rename puts ::__featherweight_puts}
+        interp alias $code_interp puts {} ::featherweight::interp_puts $code_interp
+    }
+
+    return $code_interp
+}
+
+
 proc ::featherweight::tool_run_code arguments {
     variable config
+    variable code_output
 
     if {[dict get $config debug]} {
         debug_log tool "run_code $arguments"
     }
 
-    try {
-        set result [exec [info nameofexecutable] << [dict get $arguments code] 2>@1]
-    } on error e {
-        set result [list Error evaluating code: $e]
+    set code_output {}
+    set status [catch {
+        interp eval [get_code_interp] [dict get $arguments code]
+    } error]
+    set result $code_output
+    set code_output {}
+
+    if {$status} {
+        append result [list Error evaluating code: $error]
     }
 
     return $result
