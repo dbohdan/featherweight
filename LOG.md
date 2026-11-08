@@ -1,4 +1,12 @@
 ## 2026-11-08 — Kimi K3.1 Pro
+- Implemented `read_file`, `write_file`, `edit_file`, and `about`, with conventional schemas and immediate tool results. `ask_user_question` was deferred by request.
+- `read_file` returns numbered UTF-8 text windows (2,000 lines by default), validates paging arguments, and points to the next offset when truncated.
+- Writes create parent directories and use temporary files plus atomic rename; existing Unix permissions are preserved. Edits require exact unique matches unless `replace_all` is enabled, and missing or ambiguous matches leave files unchanged.
+- `about` reports process/script timestamps, current UTC/local time, Tcl/Tk and platform details, model, session, and project root. Updated the default system prompt to prefer the file tools.
+- Post-restart live verification passed through the newly exposed tools: `about`, create/write, paged read, unique edit, ambiguity rejection, `replace_all`, and final Unicode-preserving read. The regression suite, Unicode/permission checks, procedure compilation, and `git diff --check` also passed; the temporary live-test file was removed.
+- Validation in separate Tcl processes passed: all procedures compile; all five tool schemas decode; real tool dispatch works; create/overwrite, paged/empty reads, unique and replace-all edits, error paths, Unicode round trips, and Unix permission preservation pass. `git diff --check` is clean. No live API test was run.
+
+## 2026-11-08 — Kimi K3.1 Pro
 - Revised the Tk UI: removed Clear, replaced the single-line input with a four-line Text widget, and kept plain Enter/KP Enter as newline insertion while adding Ctrl+Enter and Ctrl+KP Enter to submit.
 - The Send button now becomes Stop while a request/tool chain is active. Stop marks the chain inactive, unregisters request callbacks, terminates active curl processes (`kill` on Unix, `taskkill` on Windows), closes their channels, and restores Send/Ready. Closing the window also stops active work. Tool execution itself remains synchronous, so Stop cannot interrupt code already running inside a tool.
 - Tool-call code is displayed before its result for new calls and replayed conversations. `run_code` JSON arguments are decoded to show the Tcl source; other or malformed calls fall back to their raw arguments.

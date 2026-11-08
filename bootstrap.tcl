@@ -21,8 +21,9 @@ namespace eval ::featherweight {
 The user will ask for changes to the code, or ask questions about it.
 If a request is ambiguous, ask clarifying questions before making changes.
 
-You have one tool available: run_code.
-Use it as a window into the user's environment.} \
+You have tools for reading and editing files, running Tcl code, and learning about this process.
+Prefer read_file, write_file, and edit_file for file operations.
+Use run_code for other operations in the user's environment.} \
         \
         current_session default \
         sessions {default {}} \
@@ -32,15 +33,45 @@ Use it as a window into the user's environment.} \
     variable tools_available [subst {
         run_code {
             -name run_code
-            -description {Evaluate code in a stateful Tcl [info patchlevel] interp that the harness runs in.\
-                State persists between calls.\
-                Tcllib is available.\
-                You receive the return value plus whatever the code writes to stdout/stderr.}
+            -description {Evaluate code in a stateful Tcl [info patchlevel] interp that the harness runs in. State persists between calls. Tcllib is available. You receive the return value plus whatever the code writes to stdout/stderr.}
             -param {code string {The code to evaluate.}}
             -required code
             -command ::featherweight::tool_run_code
         }
+        read_file {
+            -name read_file
+            -description {Read a text file's contents with line numbers. Returns a window of the file; use offset and limit to page through a long one.}
+            -param {path string {The file's path, relative to the project root. An absolute path also works; relative is preferred for project files.}}
+            -param {offset integer {The first line to return, 1-based. Omit to start at the beginning.}}
+            -param {limit integer {How many lines to return. Omit for a default window of 2000 lines.}}
+            -required path
+            -command ::featherweight::tool_read_file
+        }
+        write_file {
+            -name write_file
+            -description {Write a file with the given full contents, creating it or completely overwriting it if it already exists. Applies immediately. To change part of an existing file use edit_file instead; use this only when you are providing the whole file.}
+            -param {path string {The file's path, relative to the project root. An absolute path also works; relative is preferred for project files.}}
+            -param {content string {The complete contents of the file.}}
+            -required {path content}
+            -command ::featherweight::tool_write_file
+        }
+        edit_file {
+            -name edit_file
+            -description {Replace an exact span of text in a file. The edit applies immediately. Make one call per change; call it several times to make several changes.}
+            -param {path string {The file's path, relative to the project root. An absolute path also works; relative is preferred for project files.}}
+            -param {old_string string {The exact existing text to replace, character for character, including all whitespace, comments, and docstrings. It must match exactly once: include enough surrounding lines to pick out the one place you mean, and make a separate call for each place if you mean several.}}
+            -param {new_string string {The text to put in its place.}}
+            -param {replace_all boolean {Replace every occurrence of old_string instead of requiring exactly one. Default false. Use it when the same text should change everywhere in the file.}}
+            -required {path old_string new_string}
+            -command ::featherweight::tool_edit_file
+        }
+        about {
+            -name about
+            -description {Report facts about this Featherweight process: its version and script, when the process started, the current date and time, the Tcl and Tk versions, the platform, and this session's model and project root. Use it instead of inferring any of these.}
+            -command ::featherweight::tool_about
+        }
     }]
+    variable process_started [clock seconds]
 }
 
 
@@ -153,7 +184,11 @@ proc ::featherweight::api_key {} {
 
 proc ::featherweight::json_tool args {
     if {[llength $args] % 2 != 0
-        || [lsort [dict keys $args]] ne {-command -description -name -param -required}} {
+        || [lsort [dict keys $args]] ni {
+            {-command -description -name}
+            {-command -description -name -param}
+            {-command -description -name -param -required}
+        }} {
         error {wrong # args: should be\
             "::featherweight::json_tool -command command -name name\
             -description description ?-param param ...? ?-required required?"}
@@ -331,6 +366,183 @@ proc ::featherweight::tool_run_code arguments {
     ] \n]
 }
 
+
+proc ::featherweight::require_tool_arguments {arguments names} {
+    foreach name $names {
+        if {![dict exists $arguments $name]} {
+            return -code error "The required \"$name\" argument was missing."
+        }
+    }
+}
+
+
+proc ::featherweight::read_text_file path {
+    set channel [open $path r]
+    if {[catch {
+        fconfigure $channel -encoding utf-8 -translation lf
+        read $channel
+    } result]} {
+        catch {close $channel}
+        return -code error $result
+    }
+    close $channel
+    return $result
+}
+
+
+proc ::featherweight::write_text_file {path content} {
+    file mkdir [file dirname $path]
+    set temporary "$path.[pid].[clock clicks].tmp"
+    set channel {}
+
+    if {[catch {
+        set channel [open $temporary w]
+        fconfigure $channel -encoding utf-8 -translation lf
+        puts -nonewline $channel $content
+        close $channel
+        set channel {}
+        if {$::tcl_platform(platform) ne {windows} && [file exists $path]} {
+            file attributes $temporary -permissions [file attributes $path -permissions]
+        }
+        file rename -force $temporary $path
+    } error options]} {
+        if {$channel ne {}} {
+            catch {close $channel}
+        }
+        catch {file delete -force $temporary}
+        return -options $options $error
+    }
+}
+
+
+proc ::featherweight::tool_read_file arguments {
+    require_tool_arguments $arguments path
+    set path [dict get $arguments path]
+    if {[string trim $path] eq {}} {
+        return {The required "path" argument was missing.}
+    }
+
+    set offset 1
+    if {[dict exists $arguments offset]} {
+        set offset [dict get $arguments offset]
+    }
+    if {![string is integer -strict $offset] || $offset < 1} {
+        return {The "offset" argument must be a positive line number.}
+    }
+
+    set limit 2000
+    if {[dict exists $arguments limit]} {
+        set limit [dict get $arguments limit]
+    }
+    if {![string is integer -strict $limit] || $limit < 1} {
+        return {The "limit" argument must be a positive number of lines.}
+    }
+
+    if {[catch {read_text_file $path} content]} {
+        return "Could not read \"$path\": $content"
+    }
+
+    set content [string map {"\r\n" "\n"} $content]
+    if {$content eq {}} {
+        set lines {}
+    } else {
+        set lines [split $content \n]
+        if {[string index $content end] eq "\n"} {
+            set lines [lrange $lines 0 end-1]
+        }
+    }
+
+    set total [llength $lines]
+    set output "$path ($total lines)\n"
+    if {$offset > $total} {
+        append output "\nLine $offset is past the end of the file.\n"
+        return $output
+    }
+
+    set first [expr {$offset - 1}]
+    set last [expr {min($first + $limit - 1, $total - 1)}]
+    set width [string length [expr {$last + 1}]]
+    for {set index $first} {$index <= $last} {incr index} {
+        append output [format "%*d\u2192%s\n" $width [expr {$index + 1}] [lindex $lines $index]]
+    }
+
+    if {$last < $total - 1} {
+        set next [expr {$last + 2}]
+        append output "\n(Lines $offset-[expr {$last + 1}] of $total. Read from offset $next for more.)\n"
+    }
+    return $output
+}
+
+
+proc ::featherweight::tool_write_file arguments {
+    require_tool_arguments $arguments {path content}
+    set path [dict get $arguments path]
+    if {[string trim $path] eq {}} {
+        return {The required "path" argument was missing.}
+    }
+
+    set existed [file exists $path]
+    if {[catch {write_text_file $path [dict get $arguments content]} error]} {
+        return "Could not write \"$path\": $error"
+    }
+    return "[expr {$existed ? {Overwrote} : {Created}}] \"$path\"."
+}
+
+
+proc ::featherweight::tool_edit_file arguments {
+    require_tool_arguments $arguments {path old_string new_string}
+    set path [dict get $arguments path]
+    if {[string trim $path] eq {}} {
+        return {The required "path" argument was missing.}
+    }
+
+    set replace_all 0
+    if {[dict exists $arguments replace_all]} {
+        set replace_all [dict get $arguments replace_all]
+        if {![string is boolean -strict $replace_all]} {
+            return {The "replace_all" argument must be a boolean.}
+        }
+    }
+    set old [dict get $arguments old_string]
+    if {$old eq {}} {
+        return {The "old_string" argument must not be empty; use write_file to replace the whole file.}
+    }
+
+    if {[catch {read_text_file $path} content]} {
+        return "Could not read \"$path\": $content"
+    }
+    set count [expr {[string length $content] - [string length [string map [list $old {}] $content]]}]
+    set count [expr {$count / [string length $old]}]
+
+    if {$count == 0} {
+        return "The search text was not found in \"$path\", so no change was made. It must match the current file contents exactly, character for character, including all whitespace, comments, and docstrings."
+    }
+    if {!$replace_all && $count != 1} {
+        return "The text to replace appears $count times in \"$path\", so it is ambiguous and nothing was changed. Include enough surrounding text to match exactly once, or use \"replace_all\": true."
+    }
+
+    set content [string map [list $old [dict get $arguments new_string]] $content]
+    if {[catch {write_text_file $path $content} error]} {
+        return "Could not write \"$path\": $error"
+    }
+    if {$replace_all} {
+        return "Replaced $count occurrence[expr {$count == 1 ? {} : {s}}] in \"$path\"."
+    }
+    return "Applied the edit to \"$path\"."
+}
+
+
+proc ::featherweight::tool_about arguments {
+    variable version
+    variable process_started
+    variable config
+
+    set now [clock seconds]
+    set script [file normalize [info script]]
+    set tk_version [expr {[catch {package present Tk} version] ? {unavailable} : $version}]
+    set lines [list  Featherweight  "Version: $version"  "Script: $script"  "Script modified: [clock format [file mtime $script] -format {%Y-%m-%d %H:%M:%S UTC} -gmt 1]"  "Process started: [clock format $process_started -format {%Y-%m-%d %H:%M:%S UTC} -gmt 1]"  {}  Time  "Now (UTC): [clock format $now -format {%Y-%m-%d %H:%M:%S UTC, %A} -gmt 1]"  "Now (local): [clock format $now -format {%Y-%m-%d %H:%M:%S %Z}]"  {}  System  "Tcl: [info patchlevel]"  "Tk: $tk_version"  "OS: $::tcl_platform(os)"  "OS version: $::tcl_platform(osVersion)"  "Architecture: $::tcl_platform(machine)"  "Platform: $::tcl_platform(platform)"  {}  Session  "Model: [dict get $config model]"  "Current session: [dict get $config current_session]"  "Project root: [pwd]"  ]
+    return [join $lines \n]\n
+}
 
 proc ::featherweight::call_tool tool_call {
     variable config
@@ -1078,9 +1290,10 @@ proc ::featherweight::main {argv0 argv} {
         return
     }
 
-    set json_tools [lmap tool_args [dict values $tools_available] {
-        json_tool {*}$tool_args
-    }]
+    set json_tools {}
+    dict for {_name tool_args} $tools_available {
+        lappend json_tools [json_tool {*}$tool_args]
+    }
 
     if {[catch {build_ui} err]} {
         ::puts "Could not create UI ($err); falling back to console mode."
