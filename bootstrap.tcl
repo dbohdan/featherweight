@@ -364,10 +364,11 @@ proc ::featherweight::call_tool tool_call {
 namespace eval ::featherweight {
     variable W {}
     variable json_tools {}
-    variable user_input {}
     variable busy 0
     variable tok {}
     variable done 0
+    variable request_channels
+    array set request_channels {}
 }
 
 
@@ -441,6 +442,21 @@ proc ::featherweight::ui_assistant {text} {
 }
 
 
+proc ::featherweight::ui_tool_code {call} {
+    set function [dict get $call function]
+    set arguments [dict get $function arguments]
+    if {[dict get $function name] eq {run_code}
+            && ![catch {json::json2dict $arguments} decoded]
+            && [dict exists $decoded code]} {
+        set code [dict get $decoded code]
+    } else {
+        set code $arguments
+    }
+    ui_append role "Tool code\n"
+    ui_append tool "$code\n\n"
+}
+
+
 proc ::featherweight::ui_tool {text} {
     ui_append role "Tool\n"
     ui_append tool "$text\n\n"
@@ -450,6 +466,7 @@ proc ::featherweight::ui_tool {text} {
 proc ::featherweight::replay_messages {} {
     variable config
 
+    set pending_tool_calls {}
     foreach message [dict get $config messages] {
         switch -- [dict get $message role] {
             user {
@@ -459,8 +476,19 @@ proc ::featherweight::replay_messages {} {
                 if {[dict exists $message content]} {
                     ui_assistant [dict get $message content]
                 }
+                set pending_tool_calls {}
+                if {[dict exists $message tool_calls]} {
+                    set pending_tool_calls [dict get $message tool_calls]
+                }
             }
             tool {
+                set id [dict get $message tool_call_id]
+                foreach call $pending_tool_calls {
+                    if {[dict get $call id] eq $id} {
+                        ui_tool_code $call
+                        break
+                    }
+                }
                 ui_tool [dict get $message content]
             }
         }
@@ -474,25 +502,59 @@ proc ::featherweight::set_ui_busy {flag} {
     set busy $flag
     if {![dict exists $W send]} { return }
     if {$flag} {
-        [dict get $W send] configure -state disabled
-        [dict get $W entry] configure -state disabled
+        [dict get $W send] configure -text "Stop" -state normal
         [dict get $W status] configure -text "Working..."
     } else {
-        [dict get $W send] configure -state normal
-        [dict get $W entry] configure -state normal
+        [dict get $W send] configure -text "Send" -state normal
         [dict get $W status] configure -text "Ready"
         focus [dict get $W entry]
     }
 }
 
 
-proc ::featherweight::submit {} {
+proc ::featherweight::stop {} {
     variable busy
-    variable user_input
+    variable curl_data
+    variable request_channels
+
+    if {!$busy} { return }
+    set busy 0
+    foreach ch [array names request_channels] {
+        fileevent $ch readable {}
+        unset -nocomplain curl_data($ch)
+        if {$::tcl_platform(platform) eq {windows}} {
+            catch {exec taskkill /PID [pid $ch] /F}
+        } else {
+            catch {exec kill [pid $ch]}
+        }
+        catch {close $ch}
+        unset request_channels($ch)
+    }
+    set_ui_busy 0
+    debug_log tool "tool-call chain stopped by user"
+}
+
+
+
+
+proc ::featherweight::submit_or_stop {} {
+    variable busy
+    if {$busy} {
+        stop
+    } else {
+        submit
+    }
+}
+
+
+proc ::featherweight::submit {} {
+    variable W
+    variable busy
     if {$busy} { return }
-    set text [string trim $user_input]
+    set entry [dict get $W entry]
+    set text [string trim [$entry get 1.0 end-1c]]
     if {$text eq {}} { return }
-    set user_input {}
+    $entry delete 1.0 end
     append_message [dict create role user content $text]
     ui_user $text
     set_ui_busy 1
@@ -500,55 +562,50 @@ proc ::featherweight::submit {} {
 }
 
 
-proc ::featherweight::clear {} {
-    variable W
-    variable config
-    variable busy
-    if {$busy} { return }
-    dict set config messages [list \
-        [dict create role system content [dict get $config system_prompt]]]
-    save_config
-    if {[dict exists $W chat]} {
-        set chat [dict get $W chat]
-        $chat configure -state normal
-        $chat delete 1.0 end
-        $chat configure -state disabled
-    }
-    debug_log tool "conversation cleared"
-}
-
-
 proc ::featherweight::request_async {} {
+    variable busy
     variable config
     variable curl_data
     variable json_tools
+    variable request_channels
 
+    if {!$busy} { return }
     set payload [json_payload [dict get $config model] $json_tools [dict get $config messages]]
     debug_log request [pretty $payload]
 
-    set curl_data(ch) {}
-    set ch [open |[list curl \
-        --data-binary @- << $payload \
-        --header "Authorization: Bearer [api_key]" \
-        --header {Content-Type: application/json} \
-        --request POST \
-        --show-error \
-        --silent \
-        --write-out "\n%{http_code} %{exitcode} %{errormsg}" \
-        [dict get $config endpoint] \
-    ]]
+    if {[catch {
+        set ch [open |[list curl  --data-binary @- << $payload  --header "Authorization: Bearer [api_key]"  --header {Content-Type: application/json}  --request POST  --show-error  --silent  --write-out "\n%{http_code} %{exitcode} %{errormsg}"  [dict get $config endpoint]  ]]
+    } error]} {
+        debug_log error "could not start curl request: $error"
+        set_ui_busy 0
+        return
+    }
 
+    set curl_data($ch) {}
+    set request_channels($ch) 1
     fconfigure $ch -blocking 0
     fileevent $ch readable [list [namespace current]::request_readable $ch]
 }
 
 
 proc ::featherweight::request_readable ch {
+    variable busy
     variable curl_data
+    variable request_channels
 
-    # Accumulate available output.
-    # Wait for EOF before parsing the response.
-    append curl_data($ch) [read $ch]
+    if {!$busy || ![info exists request_channels($ch)]} { return }
+
+    # Accumulate available output. Wait for EOF before parsing the response.
+    if {[catch {read $ch} chunk]} {
+        debug_log error "could not read curl response: $chunk"
+        fileevent $ch readable {}
+        unset -nocomplain curl_data($ch)
+        unset request_channels($ch)
+        catch {close $ch}
+        set_ui_busy 0
+        return
+    }
+    append curl_data($ch) $chunk
     if {![eof $ch]} {
         return
     }
@@ -556,12 +613,15 @@ proc ::featherweight::request_readable ch {
     fileevent $ch readable {}
     set output $curl_data($ch)
     unset curl_data($ch)
+    unset request_channels($ch)
 
     if {[catch {close $ch} error options]} {
+        if {!$busy} { return }
         debug_log error "curl request failed: $error"
         set_ui_busy 0
         return
     }
+    if {!$busy} { return }
 
     # Separate the status appended by --write-out from the response body.
     set marker [string last "\n" $output]
@@ -632,8 +692,11 @@ proc ::featherweight::request_readable ch {
 
     if {[dict exists $cleaned tool_calls]} {
         foreach call [dict get $cleaned tool_calls] {
+            if {!$busy} { return }
             debug_log tool "call: $call"
+            ui_tool_code $call
             set result [call_tool $call]
+            if {!$busy} { return }
             append_message $result
             ui_tool [dict get $result content]
         }
@@ -642,12 +705,98 @@ proc ::featherweight::request_readable ch {
     }
 
     set_ui_busy 0
+
+
 }
 
 
 proc ::featherweight::on_close {} {
+    variable busy
     variable done
+    if {$busy} { stop }
     set done 1
+}
+
+
+
+
+proc ::featherweight::text_has_selection {w} {
+    return [expr {[$w tag nextrange sel 1.0] ne {}}]
+}
+
+
+proc ::featherweight::text_copy w {
+    if {![text_has_selection $w]} { return }
+    clipboard clear -displayof $w
+    clipboard append -displayof $w [$w get sel.first sel.last]
+}
+
+
+proc ::featherweight::text_cut w {
+    if {![text_has_selection $w]} { return }
+    text_copy $w
+    $w delete sel.first sel.last
+}
+
+
+proc ::featherweight::text_paste w {
+    if {[catch {clipboard get -displayof $w -type UTF8_STRING} text]} {
+        if {[catch {clipboard get -displayof $w} text]} { return }
+    }
+    if {[text_has_selection $w]} {
+        $w delete sel.first sel.last
+    }
+    $w insert insert $text
+    $w see insert
+}
+
+
+proc ::featherweight::text_select_all w {
+    $w tag remove sel 1.0 end
+    $w tag add sel 1.0 end-1c
+    $w mark set insert end-1c
+    $w see insert
+}
+
+
+proc ::featherweight::show_text_context_menu {w x y editable} {
+    variable W
+    if {![dict exists $W context_menu]} {
+        set menu .context_menu
+        menu $menu -tearoff 0
+        dict set W context_menu $menu
+    } else {
+        set menu [dict get $W context_menu]
+    }
+    $menu delete 0 end
+
+    if {$editable} {
+        $menu add command -label "Cut" -command [list [namespace current]::text_cut $w]
+        $menu entryconfigure end -state [expr {[text_has_selection $w] ? "normal" : "disabled"}]
+    }
+    $menu add command -label "Copy" -command [list [namespace current]::text_copy $w]
+    $menu entryconfigure end -state [expr {[text_has_selection $w] ? "normal" : "disabled"}]
+    if {$editable} {
+        $menu add command -label "Paste" -command [list [namespace current]::text_paste $w]
+        if {[catch {clipboard get -displayof $w}]} {
+            $menu entryconfigure end -state disabled
+        } else {
+            $menu entryconfigure end -state normal
+        }
+    }
+    $menu add command -label "Select All" -command [list [namespace current]::text_select_all $w]
+    $menu entryconfigure end -state [expr {[$w get 1.0 end-1c] eq {} ? "disabled" : "normal"}]
+
+    $w mark set insert @$x,$y
+    focus $w
+    tk_popup $menu [expr {[winfo rootx $w] + $x}] [expr {[winfo rooty $w] + $y}]
+}
+
+
+proc ::featherweight::install_text_context_menu {w {editable 0}} {
+    set command [list [namespace current]::show_text_context_menu $w %x %y $editable]
+    bind $w <Button-3> $command
+    bind $w <Control-Button-1> $command
 }
 
 
@@ -697,14 +846,12 @@ proc ::featherweight::build_ui {} {
 
     ttk::frame .root.input
     pack .root.input -fill x -pady {6 0}
-    ttk::entry .root.input.e -textvariable ::featherweight::user_input
-    ttk::button .root.input.clear -text "Clear" -command ::featherweight::clear
-    ttk::button .root.input.send -text "Send" -command ::featherweight::submit
-    pack .root.input.send -side right -padx {4 0}
-    pack .root.input.clear -side right
-    pack .root.input.e -side left -fill x -expand 1
-    bind .root.input.e <Return> {::featherweight::submit; break}
-    bind .root.input.e <KP_Enter> {::featherweight::submit; break}
+    text .root.input.e -wrap word -height 4 -width 40 -undo 1
+    bind .root.input.e <Control-Return> {::featherweight::submit; break}
+    bind .root.input.e <Control-KP_Enter> {::featherweight::submit; break}
+    ttk::button .root.input.send -text "Send" -command ::featherweight::submit_or_stop
+    pack .root.input.send -side right -anchor n -padx {4 0}
+    pack .root.input.e -side left -fill both -expand 1
 
     ttk::label .root.status -text "Ready" -anchor w
     pack .root.status -fill x
@@ -730,6 +877,9 @@ proc ::featherweight::build_ui {} {
     $dbg tag configure cat_response -foreground #a5d6a7
     $dbg tag configure cat_tool -foreground #ce93d8
 
+    install_text_context_menu [dict get $W chat]
+    install_text_context_menu [dict get $W debug]
+    install_text_context_menu [dict get $W entry] 1
     focus [dict get $W entry]
 }
 

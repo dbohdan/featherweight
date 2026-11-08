@@ -1,4 +1,11 @@
 ## 2026-11-08 — Kimi K3.1 Pro
+- Revised the Tk UI: removed Clear, replaced the single-line input with a four-line Text widget, and kept plain Enter/KP Enter as newline insertion while adding Ctrl+Enter and Ctrl+KP Enter to submit.
+- The Send button now becomes Stop while a request/tool chain is active. Stop marks the chain inactive, unregisters request callbacks, terminates active curl processes (`kill` on Unix, `taskkill` on Windows), closes their channels, and restores Send/Ready. Closing the window also stops active work. Tool execution itself remains synchronous, so Stop cannot interrupt code already running inside a tool.
+- Tool-call code is displayed before its result for new calls and replayed conversations. `run_code` JSON arguments are decoded to show the Tcl source; other or malformed calls fall back to their raw arguments.
+- Added shared right-click context menus to Conversation, Debug, and input. Copy and Select All are available everywhere; Cut and Paste are input-only. Copy is enabled only with a selection, and Cut/Paste states reflect selection/clipboard availability.
+- Validation: Tcl source check and `git diff --check` pass. Tk tests verified multiline Enter behavior, Ctrl+Enter submission, Send/Stop transitions, clipboard Cut/Copy/Paste and menu states, replayed code-before-result ordering, and termination/cleanup of a hanging curl process. No live API request was made.
+
+## 2026-11-08 — Kimi K3.1 Pro
 - Added persistence of the complete configuration, including `messages`, to `config.tcl` in the launch directory.
 - Loads and restores saved conversations at startup, replays user/assistant/tool messages in the GUI, saves after every appended message and tool result, and persists Clear.
 - Writes through a PID-specific temporary file followed by an atomic rename. Save errors are logged without discarding the in-memory turn.
