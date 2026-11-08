@@ -1,3 +1,9 @@
+## 2026-11-09 — Kimi K3.1 Pro
+- Added `context_size` (default 1,048,576 tokens), persisted `/context-size ?tokens|off?`, and approximate usage reporting. Estimates use Unicode characters divided by four and include serialized tool calls and schemas; `off` disables automatic folding.
+- Added deterministic rolling compaction before GUI and console requests. When history exceeds `context_size/2` (minimum 2,048 tokens), old whole turns are dropped toward half that budget, with the latest turn kept whole as a fallback. Cuts occur only at genuine user-turn boundaries, preserving assistant/tool-result pairing.
+- Dropped turns are replaced by a marked user-role note quoting their user messages verbatim; earlier notes are not duplicated. The system prompt is preserved, folds are saved, and oversized remaining requests fail with an actionable error instead of looping.
+- Validation passed in separate processes: repeated folds, exact user-text retention, tool pairing, latest-turn and disabled behavior, config migration/validation, slash handling, and oversized requests. Tk tests covered `/context-size`, usage reporting, and refreshed history. Existing file-tool, Unicode/permission, procedure-compilation, and `git diff --check` tests pass. No live API request was made.
+
 ## 2026-11-08 — Kimi K3.1 Pro
 - Implemented `read_file`, `write_file`, `edit_file`, and `about`, with conventional schemas and immediate tool results. `ask_user_question` was deferred by request.
 - `read_file` returns numbered UTF-8 text windows (2,000 lines by default), validates paging arguments, and points to the next offset when truncated.

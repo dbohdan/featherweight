@@ -17,6 +17,7 @@ namespace eval ::featherweight {
         api_key_env_var OPENROUTER_API_KEY \
         endpoint https://openrouter.ai/api/v1/chat/completions \
         model moonshotai/kimi-k3.1-pro \
+        context_size 1048576 \
         system_prompt {You are an expert software developer working with a user on their code.
 The user will ask for changes to the code, or ask questions about it.
 If a request is ambiguous, ask clarifying questions before making changes.
@@ -94,6 +95,15 @@ proc ::featherweight::init_config {} {
         set config $loaded
     }
 
+    if {![dict exists $config context_size]} {
+        dict set config context_size 1048576
+    }
+    set context_size [dict get $config context_size]
+    if {![string is integer -strict $context_size]
+            || ($context_size != 0 && $context_size < 4096)} {
+        error {context_size must be 0 (off) or an integer of at least 4096 tokens}
+    }
+
     set system_message [dict create role system content [dict get $config system_prompt]]
     if {![dict exists $config sessions] || [dict size [dict get $config sessions]] == 0} {
         dict set config sessions default [list $system_message]
@@ -112,6 +122,173 @@ proc ::featherweight::init_config {} {
 proc ::featherweight::current_messages {} {
     variable config
     return [dict get $config sessions [dict get $config current_session]]
+}
+
+
+# Approximate tokens the same way Strument's RuneCounter does: Unicode code
+# points divided by four. Count the wire representation so tool arguments and
+# per-message overhead are not invisible to the context budget.
+proc ::featherweight::estimate_tokens {text} {
+    return [expr {[string length $text] / 4}]
+}
+
+
+proc ::featherweight::messages_tokens messages {
+    set total 0
+    foreach message $messages {
+        incr total [estimate_tokens [json_message $message]]
+    }
+    return $total
+}
+
+
+proc ::featherweight::tools_tokens json_tools {
+    return [estimate_tokens [::json::write array {*}$json_tools]]
+}
+
+
+proc ::featherweight::history_budget {} {
+    variable config
+    if {![dict exists $config context_size]} {
+        return 0
+    }
+    set context_size [dict get $config context_size]
+    if {![string is integer -strict $context_size] || $context_size <= 0} {
+        return 0
+    }
+    return [expr {max($context_size / 2, 2048)}]
+}
+
+
+proc ::featherweight::context_report {} {
+    variable config
+    variable json_tools
+
+    set size [dict get $config context_size]
+    set history [messages_tokens [current_messages]]
+    set tools [tools_tokens $json_tools]
+    set total [expr {$history + $tools}]
+    set report [format {Approximate request usage: %d tokens (%d history + %d tool schemas).} $total $history $tools]
+    if {$size > 0} {
+        append report [format "\nContext window: %d tokens; automatic compaction at %d history tokens." $size [history_budget]]
+        append report [format "\nEstimated total usage: %.1f%% of the window." [expr {100.0 * $total / $size}]]
+    } else {
+        append report "\nAutomatic compaction is disabled."
+    }
+    return $report
+}
+
+
+proc ::featherweight::harness_note {text} {
+    return [dict create role user content "\[featherweight\] $text"]
+}
+
+
+proc ::featherweight::is_harness_note message {
+    return [expr {[dict get $message role] eq {user}
+        && [string match {\[featherweight\]*} [dict get $message content]]}]
+}
+
+
+proc ::featherweight::user_texts messages {
+    set texts {}
+    foreach message $messages {
+        if {[dict get $message role] eq {user} && ![is_harness_note $message]} {
+            set text [string trim [dict get $message content]]
+            if {$text ne {}} {
+                lappend texts $text
+            }
+        }
+    }
+    return $texts
+}
+
+
+proc ::featherweight::roll_note texts {
+    set text {Earlier turns of this session were dropped to keep it inside the context window. What the user said in them is kept below, word for word, oldest first. The work those turns did is not kept: where it matters, check the files or run the commands again.}
+    foreach message $texts {
+        append text "\n\n> [string map [list "\n" "\n> "] $message]"
+    }
+    return [harness_note $text]
+}
+
+
+proc ::featherweight::set_current_messages messages {
+    variable config
+    dict set config sessions [dict get $config current_session] $messages
+    save_config
+}
+
+
+proc ::featherweight::compact_context {} {
+    set messages [current_messages]
+    set budget [history_budget]
+    if {$budget == 0 || [messages_tokens $messages] <= $budget} {
+        return 0
+    }
+
+    # Keep the system prompt outside the fold. Every other genuine user message
+    # begins a turn, so cutting there cannot orphan a tool call from its result.
+    set starts {}
+    for {set index 1} {$index < [llength $messages]} {incr index} {
+        set message [lindex $messages $index]
+        if {[dict get $message role] eq {user} && ![is_harness_note $message]} {
+            lappend starts $index
+        }
+    }
+
+    set said {}
+    set cut -1
+    set note {}
+    foreach index $starts {
+        set candidate_said [concat $said [user_texts [lrange $messages 1 $index-1]]]
+        set candidate_note [roll_note $candidate_said]
+        set tail [lrange $messages $index end]
+        if {[messages_tokens [list $candidate_note {*}$tail]] <= [expr {$budget / 2}]} {
+            set cut $index
+            set said $candidate_said
+            set note $candidate_note
+            break
+        }
+    }
+    if {$cut < 0 && [llength $starts] > 0} {
+        # Even one turn may exceed the target. Keep the latest turn whole rather
+        # than destroying its context or repeatedly folding on every request.
+        set cut [lindex $starts end]
+        set said [user_texts [lrange $messages 1 $cut-1]]
+        set note [roll_note $said]
+    }
+    if {$cut < 0} {
+        return 0
+    }
+
+    set before [messages_tokens $messages]
+    set before_count [llength $messages]
+    set compacted [list [lindex $messages 0] $note {*}[lrange $messages $cut end]]
+    set after [messages_tokens $compacted]
+    if {$after >= $before} {
+        return 0
+    }
+    set_current_messages $compacted
+    debug_log tool "compacted history: dropped [expr {$cut - 1}] of [expr {$before_count - 1}] messages ($before -> $after tokens); user messages kept verbatim"
+    refresh_session
+    return 1
+}
+
+
+proc ::featherweight::prepare_request {} {
+    variable config
+    variable json_tools
+
+    compact_context
+    set size [dict get $config context_size]
+    set history [messages_tokens [current_messages]]
+    set tools [tools_tokens $json_tools]
+    set total [expr {$history + $tools}]
+    if {$size > 0 && $total > $size} {
+        error "estimated request is $total tokens, over the configured context_size of $size; start a new session or increase /context-size"
+    }
+    return [current_messages]
 }
 
 
@@ -850,6 +1027,27 @@ proc ::featherweight::handle_slash_command text {
             update_window_title
             debug_log tool "model set to $model"
         }
+        context-size {
+            set value [string tolower [string trim $arguments]]
+            if {$value eq {}} {
+                debug_log tool [context_report]
+                return 1
+            }
+            if {$value ni {off} && (![string is integer -strict $value] || $value < 4096)} {
+                debug_log error {usage: /context-size ?tokens|off? (tokens must be at least 4096)}
+                return 1
+            }
+            if {$value ne {off} && [llength $value] != 1} {
+                debug_log error {usage: /context-size ?tokens|off? (tokens must be at least 4096)}
+                return 1
+            }
+            if {$value eq {off}} {
+                set value 0
+            }
+            dict set config context_size $value
+            save_config
+            debug_log tool [context_report]
+        }
         eval {
             if {[string trim $arguments] eq {}} {
                 debug_log error {usage: /eval Tcl-code}
@@ -892,7 +1090,12 @@ proc ::featherweight::request_async {} {
     variable request_channels
 
     if {!$busy} { return }
-    set payload [json_payload [dict get $config model] $json_tools [current_messages]]
+    if {[catch {prepare_request} messages]} {
+        debug_log error $messages
+        set_ui_busy 0
+        return
+    }
+    set payload [json_payload [dict get $config model] $json_tools $messages]
     debug_log request [pretty $payload]
 
     if {[catch {
@@ -1231,7 +1434,11 @@ proc ::featherweight::console_turn {} {
     variable json_tools
     variable tok
     while 1 {
-        set payload [json_payload [dict get $config model] $json_tools [current_messages]]
+        if {[catch {prepare_request} messages]} {
+            ::puts "Error: $messages"
+            return
+        }
+        set payload [json_payload [dict get $config model] $json_tools $messages]
         debug_log request [pretty $payload]
         if {[catch {
             set tok [::http::geturl [dict get $config endpoint]\
