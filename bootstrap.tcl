@@ -26,8 +26,10 @@ Use it as a window into the user's environment.} \
         tools [subst {
             run_code {
                 -name run_code
-                -description {Evaluate code in a stateful Tcl [info patchlevel] interp that persists between calls.\
-                    Tcllib is available. You receive whatever the code writes to stdout/stderr; use puts to return results.}
+                -description {Evaluate code in a stateful Tcl [info patchlevel] interp that the harness runs in.\
+                    State persists between calls.\
+                    Tcllib is available.\
+                    You receive whatever the code writes to stdout/stderr; use puts to return results.}
                 -param {code string {The code to evaluate.}}
                 -required code
                 -command ::featherweight::tool_run_code
@@ -35,8 +37,7 @@ Use it as a window into the user's environment.} \
         }]
     ]
 
-    variable code_interp {}
-    variable code_output {}
+    variable run_code_output {}
 }
 
 
@@ -185,11 +186,12 @@ proc ::featherweight::json_payload {model json_tools messages} {
 }
 
 
-proc ::featherweight::interp_puts {interp args} {
-    variable code_output
+proc ::featherweight::puts args {
+    variable run_code_output
 
-    set nonewline [expr {[lindex $args 0] eq {-nonewline}}]
-    if {$nonewline} {
+    set prefix {}
+    if {[lindex $args 0] eq {-nonewline}} {
+        set prefix -nonewline
         set args [lrange $args 1 end]
     }
 
@@ -198,56 +200,45 @@ proc ::featherweight::interp_puts {interp args} {
             set channel stdout
             set text [lindex $args 0]
         }
+
         2 {
             lassign $args channel text
         }
+
         default {
             return -code error {wrong # args: should be "puts ?-nonewline? ?channelId? string"}
         }
     }
 
-    if {$channel ni {stdout stderr}} {
-        set forwarded [expr {$nonewline ? [linsert $args 0 -nonewline] : $args}]
-        tailcall interp eval $interp ::__featherweight_puts {*}$forwarded
-    }
-    append code_output $text [expr {$nonewline ? {} : "\n"}]
-    return
-}
-
-
-proc ::featherweight::get_code_interp {} {
-    variable code_interp
-
-    if {$code_interp eq {} || ![interp exists $code_interp]} {
-        set code_interp [interp create]
-        $code_interp eval {rename puts ::__featherweight_puts}
-        interp alias $code_interp puts {} ::featherweight::interp_puts $code_interp
+    if {$channel in {stdout stderr}} {
+        append run_code_output $text [expr {$prefix eq {-nonewline} ? {} : "\n"}]
+        return
     }
 
-    return $code_interp
+    tailcall ::puts {*}$prefix $channel $text
 }
 
 
 proc ::featherweight::tool_run_code arguments {
     variable config
-    variable code_output
+    variable run_code_output
 
     if {[dict get $config debug]} {
         debug_log tool "run_code $arguments"
     }
 
-    set code_output {}
-    set status [catch {
-        interp eval [get_code_interp] [dict get $arguments code]
-    } error]
-    set result $code_output
-    set code_output {}
+    set run_code_output {}
+    set value {}
 
-    if {$status} {
-        append result [list Error evaluating code: $error]
-    }
+    catch {
+        namespace eval ::featherweight [dict get $arguments code]
+    } result options
 
-    return $result
+    return [join [list \
+        <output>$run_code_output</output> \
+        <result>$result</result>  \
+        <options>$options</options> \
+    ] \n]
 }
 
 
@@ -320,7 +311,7 @@ proc ::featherweight::debug_log {category text} {
     }
     if {[catch {
         set fh [open [file join [pwd] featherweight-debug.log] a]
-        puts $fh "$ts ($category) $text"
+        ::puts $fh "$ts ($category) $text"
         close $fh
     }]} {}
 }
@@ -649,7 +640,7 @@ proc ::featherweight::console_main {} {
         json_tool {*}$tool_args
     }]
     set msg_list [list [dict create role system content [dict get $config system_prompt]]]
-    puts "featherweight console mode (type a message; Ctrl-D to exit)"
+    ::puts "Featherweight console mode (type a message; Ctrl-D to exit)"
     while {[gets stdin line] >= 0} {
         if {[string trim $line] eq {}} { continue }
         lappend msg_list [dict create role user content $line]
@@ -675,34 +666,34 @@ proc ::featherweight::console_turn {} {
             set status [::http::ncode $tok]
             set data [::http::data $tok]
         } err]} {
-            puts "Error: $err"
+            ::puts "Error: $err"
             return
         }
         catch {::http::cleanup $tok}
         if {$status != 200} {
-            puts "Error: HTTP $status"
+            ::puts "Error: HTTP $status"
             debug_log error "HTTP $status: $data"
             return
         }
         if {[catch {json::json2dict $data} response]} {
-            puts "Error: response was not valid JSON"
+            ::puts "Error: response was not valid JSON"
             return
         }
         if {![dict exists $response choices] || [llength [dict get $response choices]] == 0} {
-            puts "Error: response had no choices"
+            ::puts "Error: response had no choices"
             return
         }
         set choice [lindex [dict get $response choices] 0]
         set cleaned [clean_assistant_message [dict get $choice message]]
         if {[dict exists $cleaned content]} {
-            puts "Assistant: [dict get $cleaned content]"
+            ::puts "Assistant: [dict get $cleaned content]"
         }
         lappend msg_list $cleaned
         if {![dict exists $cleaned tool_calls]} { return }
         foreach call [dict get $cleaned tool_calls] {
             debug_log tool "call: $call"
             set result [call_tool $call]
-            puts "Tool: [dict get $result content]"
+            ::puts "Tool: [dict get $result content]"
             lappend msg_list $result
         }
     }
@@ -716,7 +707,7 @@ proc ::featherweight::main {argv0 argv} {
     variable done
 
     if {[catch {package require Tk} err]} {
-        puts "Tk/display unavailable ($err); falling back to console mode."
+        ::puts "Tk/display unavailable ($err); falling back to console mode."
         console_main
         return
     }
@@ -728,7 +719,7 @@ proc ::featherweight::main {argv0 argv} {
     set msg_list [list [dict create role system content [dict get $config system_prompt]]]
 
     if {[catch {build_ui} err]} {
-        puts "Could not create UI ($err); falling back to console mode."
+        ::puts "Could not create UI ($err); falling back to console mode."
         catch {destroy .}
         console_main
         return
