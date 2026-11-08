@@ -422,7 +422,7 @@ proc ::featherweight::request_async {} {
 
     set curl_data(ch) {}
     set ch [open |[list curl \
-        --data-raw $payload \
+        --data-binary @- << $payload \
         --header "Authorization: Bearer [api_key]" \
         --header {Content-Type: application/json} \
         --request POST \

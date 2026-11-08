@@ -1,3 +1,6 @@
+## 2026-11-08 - DeepSeek V4.1 Flash 1017
+- Changed the GUI curl request to pass its JSON payload through stdin using Tcl's `<<` redirection and `--data-binary @-`, avoiding command-line length limits.
+- Validated with a local HTTP echo server using a 1.38 MB payload. Tcl syntax and procedure compilation checks pass. No live OpenRouter or Tk test was run.
 ## 2026-11-08 - Kimi K3.1 Pro
 - Replaced per-call `exec` with a lazily created, persistent Tcl interpreter using `interp create`.
 - Variables, procedures, loaded packages, and working-directory changes now persist between calls.
