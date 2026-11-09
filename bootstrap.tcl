@@ -11,12 +11,12 @@ namespace eval ::featherweight {
     variable version 0.0.0
 
     # Default configuration and state.
-    variable config [dict create \
+    variable default_config [dict create \
         debug true \
         \
         api_key_env_var OPENROUTER_API_KEY \
         endpoint https://openrouter.ai/api/v1/chat/completions \
-        model moonshotai/kimi-k3.1-pro \
+        model deepseek/deepseek-v4.1-flash-1017 \
         context_size 1048576 \
         system_prompt {You are an expert software developer working with a user on their code.
 The user will ask for changes to the code, or ask questions about it.
@@ -27,8 +27,9 @@ Prefer read_file, write_file, and edit_file for file operations.
 Use run_code for other operations in the user's environment.} \
         \
         current_session default \
-        sessions {default {}} \
+        sessions {} \
     ]
+    variable config $default_config
 
     variable run_code_output {}
     variable tools_available [subst {
@@ -76,36 +77,189 @@ Use run_code for other operations in the user's environment.} \
 }
 
 
+# State lives in featherweight/ in the launch directory: the settings in
+# featherweight/config and one file per session in featherweight/sessions/.
+# The directory is resolved once, so a later "cd" cannot strand the state.
+proc ::featherweight::state_dir {} {
+    variable state_dir_cache
+    if {![info exists state_dir_cache]} {
+        set state_dir_cache [file join [pwd] featherweight]
+    }
+    return $state_dir_cache
+}
+
+
 proc ::featherweight::config_path {} {
-    return [file join [pwd] featherweight.conf]
+    return [file join [state_dir] config]
+}
+
+
+proc ::featherweight::sessions_dir {} {
+    return [file join [state_dir] sessions]
+}
+
+
+# The single-file layout used before the state was split up.
+proc ::featherweight::legacy_config_path {} {
+    variable legacy_config_path_cache
+    if {![info exists legacy_config_path_cache]} {
+        set legacy_config_path_cache [file join [pwd] featherweight.conf]
+    }
+    return $legacy_config_path_cache
+}
+
+
+# Session names may contain anything the user can type; file names may not.
+# Percent-encode every byte outside unreserved ASCII. No unreserved name
+# contains a dot, and the mapping is injective, so "." and ".." cannot escape
+# the sessions directory and distinct names never share a file.
+proc ::featherweight::session_file_name name {
+    set encoded {}
+    foreach char [split $name {}] {
+        if {[regexp {^[A-Za-z0-9_-]$} $char]} {
+            append encoded $char
+        } else {
+            set bytes [regexp -all -inline {..} [binary encode hex [encoding convertto utf-8 $char]]]
+            foreach byte $bytes {
+                append encoded %[string toupper $byte]
+            }
+        }
+    }
+    return $encoded
+}
+
+
+proc ::featherweight::session_name_from_file_name file_name {
+    set decoded {}
+    set length [string length $file_name]
+    set index 0
+    while {$index < $length} {
+        set char [string index $file_name $index]
+        if {$char ne {%}} {
+            append decoded $char
+            incr index
+            continue
+        }
+        if {$index + 2 >= $length} {
+            error "truncated escape in session file name [list $file_name]"
+        }
+        set escape [string range $file_name $index+1 $index+2]
+        if {![regexp {^[0-9A-Fa-f]{2}$} $escape]} {
+            error "invalid escape %[string range $file_name $index+1 end] in session file name [list $file_name]"
+        }
+        append decoded [binary decode hex $escape]
+        incr index 3
+    }
+    return [encoding convertfrom utf-8 $decoded]
+}
+
+
+proc ::featherweight::session_path name {
+    return [file join [sessions_dir] [session_file_name $name]]
+}
+
+
+proc ::featherweight::read_config_file path {
+    if {[catch {::fileutil::cat -encoding utf-8 $path} data options]} {
+        error "could not load [list $path]: $data" {} [dict get $options -errorinfo]
+    }
+    if {[catch {dict size $data}]} {
+        error "configuration in [list $path] is not a Tcl dict"
+    }
+    return $data
+}
+
+
+# A session file is a Tcl list of message dicts, one message per line.
+proc ::featherweight::read_session_file path {
+    if {[catch {::fileutil::cat -encoding utf-8 $path} data options]} {
+        error "could not load [list $path]: $data" {} [dict get $options -errorinfo]
+    }
+    if {[catch {llength $data}]} {
+        error "session in [list $path] is not a Tcl list"
+    }
+    set messages {}
+    foreach message $data {
+        if {[catch {dict size $message}]} {
+            error "a message in [list $path] is not a Tcl dict"
+        }
+        lappend messages $message
+    }
+    return $messages
 }
 
 
 proc ::featherweight::init_config {} {
     variable config
+    variable default_config
 
-    set path [config_path]
-    if {[file exists $path]} {
-        if {[catch {::fileutil::cat -encoding utf-8 $path} loaded options]} {
-            error "could not load [list $path]: $loaded" {} [dict get $options -errorinfo]
+    set migrated_from {}
+    if {[file exists [config_path]]} {
+        set config [read_config_file [config_path]]
+    } elseif {[file exists [legacy_config_path]]} {
+        # One-time move from the old single-file layout. The sessions are
+        # written out below; the old file is left alone so nothing is lost.
+        set legacy [read_config_file [legacy_config_path]]
+        set carried [dict create]
+        foreach key {sessions current_session} {
+            if {[dict exists $legacy $key]} {
+                dict set carried $key [dict get $legacy $key]
+                dict unset legacy $key
+            }
         }
-        if {[catch {dict size $loaded}]} {
-            error "configuration in [list $path] is not a Tcl dict"
-        }
-        set config $loaded
+        set config [dict merge $default_config $legacy $carried]
+        set migrated_from [legacy_config_path]
     }
 
-    if {![dict exists $config context_size]} {
-        dict set config context_size 1048576
-    }
+    # The config is a small file people edit by hand, so an absent setting
+    # falls back to the default instead of failing.
+    set config [dict merge $default_config $config]
+
     set context_size [dict get $config context_size]
     if {![string is integer -strict $context_size]
             || ($context_size != 0 && $context_size < 4096)} {
         error {context_size must be 0 (off) or an integer of at least 4096 tokens}
     }
 
+    # Read the sessions directory after (and over) any sessions inherited from
+    # a legacy file: files on disk are the newer copy.
+    set sessions [dict create]
+    set directory [sessions_dir]
+    if {[file isdirectory $directory]} {
+        foreach path [lsort [glob -nocomplain -directory $directory -types f *]] {
+            set file_name [file tail $path]
+            if {[string first . $file_name] >= 0} {
+                # No encoded session name contains a dot. Skip temp files and
+                # anything else that does not belong here.
+                debug_log error "ignoring session file [list $path]: not an encoded session name"
+                continue
+            }
+            if {[catch {
+                set name [session_name_from_file_name $file_name]
+                set messages [read_session_file $path]
+            } error]} {
+                # Leave an unreadable file out of the state entirely, so it is
+                # never overwritten with an empty session.
+                debug_log error "ignoring session file [list $path]: $error"
+                continue
+            }
+            if {[dict exists $sessions $name]} {
+                debug_log error "two session files decode to [list $name]; using [list $path]"
+            }
+            dict set sessions $name $messages
+        }
+    }
+    if {[dict exists $config sessions]} {
+        dict for {name messages} [dict get $config sessions] {
+            if {![dict exists $sessions $name]} {
+                dict set sessions $name $messages
+            }
+        }
+    }
+    dict set config sessions $sessions
+
     set system_message [dict create role system content [dict get $config system_prompt]]
-    if {![dict exists $config sessions] || [dict size [dict get $config sessions]] == 0} {
+    if {[dict size [dict get $config sessions]] == 0} {
         dict set config sessions default [list $system_message]
     }
     if {![dict exists $config current_session]
@@ -115,7 +269,18 @@ proc ::featherweight::init_config {} {
     if {[llength [current_messages]] == 0} {
         dict set config sessions [dict get $config current_session] [list $system_message]
     }
+
     save_config
+    # Persist every session that exists only in memory: the default session, a
+    # migrated one, or one configured by hand in featherweight/config.
+    dict for {name messages} [dict get $config sessions] {
+        if {![file exists [session_path $name]]} {
+            save_session $name
+        }
+    }
+    if {$migrated_from ne {}} {
+        debug_log tool "migrated from [list $migrated_from] to [state_dir]; the old file is no longer read and can be deleted"
+    }
 }
 
 
@@ -215,8 +380,9 @@ proc ::featherweight::roll_note texts {
 
 proc ::featherweight::set_current_messages messages {
     variable config
-    dict set config sessions [dict get $config current_session] $messages
-    save_config
+    set name [dict get $config current_session]
+    dict set config sessions $name $messages
+    save_session $name
 }
 
 
@@ -292,6 +458,8 @@ proc ::featherweight::prepare_request {} {
 }
 
 
+# The settings only. Sessions are separate files; keeping them out of here is
+# the point of the split.
 proc ::featherweight::save_config {} {
     variable config
 
@@ -299,23 +467,41 @@ proc ::featherweight::save_config {} {
     set temporary "$path.[pid].tmp"
 
     if {[catch {
+        file mkdir [file dirname $path]
         set channel [open $temporary w]
         fconfigure $channel -encoding utf-8
 
         dict for {key value} $config {
-            if {$key eq {sessions}} {
-                ::puts $channel "sessions {"
-                dict for {name messages} $value {
-                    ::puts $channel "    [list $name] {"
-                    foreach message $messages {
-                        ::puts $channel "        [list $message]"
-                    }
-                    ::puts $channel "    }"
-                }
-                ::puts $channel "}"
-            } else {
+            if {$key ne {sessions}} {
                 ::puts $channel [list $key $value]
             }
+        }
+
+        close $channel
+        file rename -force $temporary $path
+    } error]} {
+        catch {close $channel}
+        catch {file delete -force $temporary}
+        debug_log error "could not save [list $path]: $error"
+    }
+}
+
+
+proc ::featherweight::save_session name {
+    variable config
+
+    if {![dict exists $config sessions $name]} { return }
+
+    set path [session_path $name]
+    set temporary "$path.[pid].tmp"
+
+    if {[catch {
+        file mkdir [file dirname $path]
+        set channel [open $temporary w]
+        fconfigure $channel -encoding utf-8
+
+        foreach message [dict get $config sessions $name] {
+            ::puts $channel [list $message]
         }
 
         close $channel
@@ -331,11 +517,14 @@ proc ::featherweight::save_config {} {
 proc ::featherweight::append_message message {
     variable config
 
-    set sessions [dict get $config sessions]
-    dict lappend sessions [dict get $config current_session] $message
-    dict set config sessions $sessions
+    set name [dict get $config current_session]
+    # Not "dict lappend config sessions $name $message": two keys make a nested
+    # path, which would replace the session instead of appending to it.
+    set messages [dict get $config sessions $name]
+    lappend messages $message
+    dict set config sessions $name $messages
 
-    save_config
+    save_session $name
 }
 
 
@@ -997,6 +1186,7 @@ proc ::featherweight::switch_session name {
                 content [dict get $config system_prompt] \
             ] \
         ]
+        save_session $name
     }
     dict set config current_session $name
     save_config
