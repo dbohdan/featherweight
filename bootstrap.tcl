@@ -346,11 +346,26 @@ proc ::featherweight::set_current_messages messages {
 }
 
 
-proc ::featherweight::compact_context {} {
+# Fold the current session's history so it fits the context budget; called
+# before every request. With $force (/compact) it folds even when the history
+# already fits, aiming at half of what is there instead of at half the budget,
+# and never higher than the automatic target -- so a forced fold cannot leave
+# the session over a window the automatic rule would have respected.
+proc ::featherweight::compact_context {{force 0}} {
     set messages [current_messages]
+    set before [messages_tokens $messages]
     set budget [history_budget]
-    if {$budget == 0 || [messages_tokens $messages] <= $budget} {
+    if {!$force && ($budget == 0 || $before <= $budget)} {
         return 0
+    }
+
+    if {$force} {
+        set target [expr {$before / 2}]
+        if {$budget > 0} {
+            set target [expr {min($target, $budget / 2)}]
+        }
+    } else {
+        set target [expr {$budget / 2}]
     }
 
     # Keep the system prompt outside the fold. Every other genuine user message
@@ -370,7 +385,7 @@ proc ::featherweight::compact_context {} {
         set candidate_said [concat $said [user_texts [lrange $messages 1 $index-1]]]
         set candidate_note [roll_note $candidate_said]
         set tail [lrange $messages $index end]
-        if {[messages_tokens [list $candidate_note {*}$tail]] <= [expr {$budget / 2}]} {
+        if {[messages_tokens [list $candidate_note {*}$tail]] <= $target} {
             set cut $index
             set said $candidate_said
             set note $candidate_note
@@ -385,18 +400,29 @@ proc ::featherweight::compact_context {} {
         set note [roll_note $said]
     }
     if {$cut < 0} {
+        if {$force} {
+            debug_log tool {context not folded: the session has no user turn to cut at}
+        }
         return 0
     }
 
-    set before [messages_tokens $messages]
     set before_count [llength $messages]
     set compacted [list [lindex $messages 0] $note {*}[lrange $messages $cut end]]
     set after [messages_tokens $compacted]
     if {$after >= $before} {
+        if {$force} {
+            debug_log tool "context not folded: keeping the latest turn whole\
+                and quoting the user's words verbatim would leave approximately\
+                $after tokens, at least as many as the $before it has now"
+        }
         return 0
     }
     set_current_messages $compacted
-    debug_log tool "compacted history: dropped [expr {$cut - 1}] of [expr {$before_count - 1}] messages ($before -> $after tokens); user messages kept verbatim"
+    set label {compacted history}
+    if {$force} {
+        set label {folded on request}
+    }
+    debug_log tool "$label: dropped [expr {$cut - 1}] of [expr {$before_count - 1}] messages ($before -> $after tokens); user messages kept verbatim"
     refresh_session
     return 1
 }
@@ -1162,6 +1188,14 @@ proc ::featherweight::handle_slash_command text {
             dict set config context_size $value
             save_config
             debug_log tool [context_report]
+        }
+        compact {
+            if {[string trim $arguments] ne {}} {
+                debug_log error {usage: /compact}
+                return 1
+            }
+            # Folds now, even when the history already fits the context budget.
+            compact_context 1
         }
         eval {
             if {[string trim $arguments] eq {}} {
