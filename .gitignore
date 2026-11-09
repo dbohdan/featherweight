@@ -1,6 +1,7 @@
 /attic/
 
 featherweight.conf
+/featherweight/
 *.bak*
 *.sw*
 *.log

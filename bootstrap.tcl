@@ -16,7 +16,7 @@ namespace eval ::featherweight {
         \
         api_key_env_var OPENROUTER_API_KEY \
         endpoint https://openrouter.ai/api/v1/chat/completions \
-        model moonshotai/kimi-k3.1-pro \
+        model xiaomi/mimo-v2.6-flash \
         context_size 1048576 \
         system_prompt {You are an expert software developer working with a user on their code.
 The user will ask for changes to the code, or ask questions about it.
@@ -27,8 +27,11 @@ Prefer read_file, write_file, and edit_file for file operations.
 Use run_code for other operations in the user's environment.} \
         \
         current_session default \
-        sessions {default {}} \
     ]
+
+    # The sessions this process has read from disk: name -> messages. A session
+    # not in here has not been looked at yet; see load_session.
+    variable sessions [dict create]
 
     variable run_code_output {}
     variable tools_available [subst {
@@ -76,8 +79,90 @@ Use run_code for other operations in the user's environment.} \
 }
 
 
+# The directory that holds the configuration and the sessions, relative to the
+# project root (the launch directory).
+proc ::featherweight::state_dir {} {
+    return [file join [pwd] featherweight]
+}
+
+
 proc ::featherweight::config_path {} {
-    return [file join [pwd] featherweight.conf]
+    return [file join [state_dir] config]
+}
+
+
+proc ::featherweight::sessions_dir {} {
+    return [file join [state_dir] sessions]
+}
+
+
+# The file that holds one session. A session name doubles as its file name, so
+# a name that is not a plain file name is refused here rather than escaping the
+# sessions directory.
+proc ::featherweight::session_path {name} {
+    if {$name eq {}
+            || $name in {. ..}
+            || [file tail $name] ne $name
+            || [string first "\\" $name] >= 0} {
+        error "invalid session name \"$name\": a session name must be a plain file name, without path separators"
+    }
+    return [file join [sessions_dir] $name]
+}
+
+
+# Whether the session has a file. An unusable name has no session.
+proc ::featherweight::session_exists {name} {
+    if {[catch {session_path $name} path]} {
+        return 0
+    }
+    return [file exists $path]
+}
+
+
+# The names of every session that has a file, sorted.
+proc ::featherweight::session_names {} {
+    set directory [sessions_dir]
+    if {![file isdirectory $directory]} {
+        return {}
+    }
+
+    set names {}
+    foreach path [glob -nocomplain -directory $directory *] {
+        if {![file isfile $path]} {
+            continue
+        }
+        set name [file tail $path]
+        if {![catch {session_path $name}]} {
+            lappend names $name
+        }
+    }
+    return [lsort $names]
+}
+
+
+# Read one session from its file, which holds a Tcl list of message dicts. A
+# session with no file yet has no messages; a file that cannot be read or
+# understood is an error rather than an empty session, so that a later save
+# never overwrites it.
+proc ::featherweight::read_session {name} {
+    set path [session_path $name]
+    if {![file exists $path]} {
+        return {}
+    }
+    if {[catch {::fileutil::cat -encoding utf-8 $path} content options]} {
+        error "could not load [list $path]: $content" {} [dict get $options -errorinfo]
+    }
+    if {[catch {llength $content} count]} {
+        error "session in [list $path] is not a Tcl list"
+    }
+    for {set index 0} {$index < $count} {incr index} {
+        set message [lindex $content $index]
+        if {[catch {dict get $message role}]} {
+            set shown [string range [list $message] 0 79]
+            error "message $index in [list $path] is not a message dict: $shown"
+        }
+    }
+    return $content
 }
 
 
@@ -104,24 +189,62 @@ proc ::featherweight::init_config {} {
         error {context_size must be 0 (off) or an integer of at least 4096 tokens}
     }
 
-    set system_message [dict create role system content [dict get $config system_prompt]]
-    if {![dict exists $config sessions] || [dict size [dict get $config sessions]] == 0} {
-        dict set config sessions default [list $system_message]
-    }
+    # The current session must name a session file; anything else starts over
+    # at the default session.
     if {![dict exists $config current_session]
-            || ![dict exists $config sessions [dict get $config current_session]]} {
+            || ![session_exists [dict get $config current_session]]} {
         dict set config current_session default
     }
+
+    set system_message [dict create role system content [dict get $config system_prompt]]
     if {[llength [current_messages]] == 0} {
-        dict set config sessions [dict get $config current_session] [list $system_message]
+        set_current_messages [list $system_message]
     }
     save_config
 }
 
 
-proc ::featherweight::current_messages {} {
+# The session's messages, read from its file the first time this process needs
+# them and kept in memory after that.
+proc ::featherweight::load_session {name} {
+    variable sessions
+
+    if {![dict exists $sessions $name]} {
+        dict set sessions $name [read_session $name]
+    }
+    return [dict get $sessions $name]
+}
+
+
+proc ::featherweight::current_session_name {} {
     variable config
-    return [dict get $config sessions [dict get $config current_session]]
+    return [dict get $config current_session]
+}
+
+
+proc ::featherweight::current_messages {} {
+    return [load_session [current_session_name]]
+}
+
+
+# Write one session back to its own file. A session this process has not read
+# has nothing in memory to write, so it is left alone.
+proc ::featherweight::save_session {name} {
+    variable sessions
+
+    if {![dict exists $sessions $name]} {
+        return
+    }
+
+    set text {}
+    foreach message [dict get $sessions $name] {
+        append text [list $message] \n
+    }
+
+    set path [session_path $name]
+    if {[catch {write_text_file $path $text} error]} {
+        debug_log error "could not save [list $path]: $error"
+    }
 }
 
 
@@ -215,8 +338,11 @@ proc ::featherweight::roll_note texts {
 
 proc ::featherweight::set_current_messages messages {
     variable config
-    dict set config sessions [dict get $config current_session] $messages
-    save_config
+    variable sessions
+
+    set name [dict get $config current_session]
+    dict set sessions $name $messages
+    save_session $name
 }
 
 
@@ -292,37 +418,19 @@ proc ::featherweight::prepare_request {} {
 }
 
 
+# Write the configuration. Sessions are not part of it: each one is written to
+# its own file by save_session, so this file stays small however long the
+# conversations grow.
 proc ::featherweight::save_config {} {
     variable config
 
     set path [config_path]
-    set temporary "$path.[pid].tmp"
+    set text {}
+    dict for {key value} $config {
+        append text [list $key $value] \n
+    }
 
-    if {[catch {
-        set channel [open $temporary w]
-        fconfigure $channel -encoding utf-8
-
-        dict for {key value} $config {
-            if {$key eq {sessions}} {
-                ::puts $channel "sessions {"
-                dict for {name messages} $value {
-                    ::puts $channel "    [list $name] {"
-                    foreach message $messages {
-                        ::puts $channel "        [list $message]"
-                    }
-                    ::puts $channel "    }"
-                }
-                ::puts $channel "}"
-            } else {
-                ::puts $channel [list $key $value]
-            }
-        }
-
-        close $channel
-        file rename -force $temporary $path
-    } error]} {
-        catch {close $channel}
-        catch {file delete -force $temporary}
+    if {[catch {write_text_file $path $text} error]} {
         debug_log error "could not save [list $path]: $error"
     }
 }
@@ -330,12 +438,13 @@ proc ::featherweight::save_config {} {
 
 proc ::featherweight::append_message message {
     variable config
+    variable sessions
 
-    set sessions [dict get $config sessions]
-    dict lappend sessions [dict get $config current_session] $message
-    dict set config sessions $sessions
+    set name [dict get $config current_session]
+    load_session $name
+    dict lappend sessions $name $message
 
-    save_config
+    save_session $name
 }
 
 
@@ -986,17 +1095,23 @@ proc ::featherweight::refresh_session {} {
 
 proc ::featherweight::switch_session name {
     variable config
+    variable sessions
 
     if {$name eq {}} {
         error {session name cannot be empty}
     }
-    if {![dict exists $config sessions $name]} {
-        dict set config sessions $name [list \
+    # Validates the name before anything is created or written.
+    session_path $name
+
+    # An existing session is loaded only now that it is about to be shown.
+    if {[llength [load_session $name]] == 0} {
+        dict set sessions $name [list \
             [dict create \
                 role system \
                 content [dict get $config system_prompt] \
             ] \
         ]
+        save_session $name
     }
     dict set config current_session $name
     save_config
@@ -1060,7 +1175,7 @@ proc ::featherweight::handle_slash_command text {
         session {
             set name [string trim $arguments]
             if {$name eq {}} {
-                set names [lsort [dict keys [dict get $config sessions]]]
+                set names [session_names]
                 debug_log tool "current session: [dict get $config current_session]; sessions: $names"
                 return 1
             }
