@@ -16,7 +16,7 @@ namespace eval ::featherweight {
         \
         api_key_env_var OPENROUTER_API_KEY \
         endpoint https://openrouter.ai/api/v1/chat/completions \
-        model xiaomi/mimo-v2.6-flash \
+        model xiaomi/mimo-v2.6-flash:nitro \
         context_size 1048576 \
         timestamp_format {%Y-%m-%d %H:%M:%S %z} \
         system_prompt {You are an expert software developer working with a user on their code.
