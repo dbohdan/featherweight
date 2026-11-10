@@ -1087,6 +1087,9 @@ proc ::featherweight::apply_message {cleaned} {
         if {!$busy} { return 0 }
         set result [append_message $result]
         ui_tool [dict get $result content] [message_time $result]
+        # A tool can change what the title shows: run_code can cd, and any
+        # tool can change harness state.
+        update_window_title
     }
     return $busy
 }
@@ -1279,11 +1282,14 @@ proc ::featherweight::submit {} {
 }
 
 
+# The title says where the harness is running and on what model. Both can move
+# under us -- /eval can cd, /model changes the model, a tool can change either
+# -- so it is rebuilt from state each time rather than kept.
 proc ::featherweight::update_window_title {} {
     variable config
     variable W
     if {![dict exists $W chat]} { return }
-    wm title . "Featherweight - [dict get $config model] - [dict get $config current_session]"
+    wm title . "Featherweight - [file tail [pwd]]/ - [dict get $config model]"
 }
 
 
@@ -1346,7 +1352,6 @@ proc ::featherweight::handle_slash_command text {
             }
             dict set config model $model
             save_config
-            update_window_title
             debug_log tool "model set to $model"
         }
         context-size {
@@ -1408,6 +1413,10 @@ proc ::featherweight::handle_slash_command text {
             debug_log error "unknown command: /$command"
         }
     }
+    # Every command that got this far may have changed what the title shows:
+    # /model the model, /eval the working directory, /session and /compact the
+    # session. The queries above return early because they change nothing.
+    update_window_title
     return 1
 }
 
@@ -1628,7 +1637,6 @@ proc ::featherweight::build_ui {} {
 
     catch {ttk::style theme use clam}
 
-    update_window_title
     wm minsize . 640 420
     wm geometry . 900x650
     wm protocol . WM_DELETE_WINDOW ::featherweight::on_close
@@ -1666,14 +1674,17 @@ proc ::featherweight::build_ui {} {
     grid columnconfigure .root.pane.dbgf.body 0 -weight 1
     .root.pane add .root.pane.dbgf -weight 2
 
-    ttk::frame .root.input
-    pack .root.input -fill x -pady {6 0}
+    # The input is the third pane of the same panedwindow as Conversation and
+    # Debug, so the sash above it sets its height. The padding keeps it off
+    # that sash, and the button fills the pane's height beside the text.
+    ttk::frame .root.input -padding {0 6 0 0}
     text .root.input.e -wrap word -height 4 -width 40 -undo 1
     bind .root.input.e <Control-Return> {::featherweight::submit; break}
     bind .root.input.e <Control-KP_Enter> {::featherweight::submit; break}
     ttk::button .root.input.send -text "Send" -command ::featherweight::submit_or_stop
-    pack .root.input.send -side right -anchor n -padx {4 0}
+    pack .root.input.send -side right -fill y -padx {4 0}
     pack .root.input.e -side left -fill both -expand 1
+    .root.pane add .root.input -weight 1
 
     ttk::label .root.status -text "Ready" -anchor w
     pack .root.status -fill x
@@ -1685,20 +1696,16 @@ proc ::featherweight::build_ui {} {
         send .root.input.send\
         status .root.status]
 
+    # update_window_title waits for the chat widget in W, so it can only run
+    # once W is in place; called any earlier it would leave Tk's default title.
+    update_window_title
+
     set chat [dict get $W chat]
     font create ::featherweight::role_font  {*}[font configure TkTextFont]  -weight bold
     $chat tag configure role -font ::featherweight::role_font -foreground #555555
-    # Timestamps sit beside the label in a smaller font. The sign convention
-    # for -size differs between platforms, but either way taking two off the
-    # magnitude shrinks the font.
-    font create ::featherweight::timestamp_font {*}[font configure TkTextFont]
-    set size [font configure ::featherweight::timestamp_font -size]
-    if {$size > 2} {
-        font configure ::featherweight::timestamp_font -size [expr {$size - 2}]
-    } elseif {$size < -2} {
-        font configure ::featherweight::timestamp_font -size [expr {$size + 2}]
-    }
-    $chat tag configure timestamp -font ::featherweight::timestamp_font -foreground #555555
+    # Timestamps sit beside the label at the size of the message text: it is
+    # the label's weight that sets the two apart, so the time stays legible.
+    $chat tag configure timestamp -font TkTextFont -foreground #555555
     $chat tag configure user -foreground #0b57d0
     $chat tag configure assistant -foreground #1b5e20
     $chat tag configure tool -foreground #6a1b9a
