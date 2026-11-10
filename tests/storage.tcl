@@ -26,6 +26,14 @@ ok "default session holds the system message" {
 ok "only the current session was read into memory" {
     expr {[dict keys $::featherweight::sessions] eq {default}}
 }
+ok "the configuration carries the timestamp format" {
+    set saved [slurp $config_path]
+    expr {[dict get $saved timestamp_format] eq {%Y-%m-%d %H:%M:%S %z}}
+}
+ok "the format is the one used for display" {
+    expr {[::featherweight::format_time 1794401724]
+        eq [clock format 1794401724 -format {%Y-%m-%d %H:%M:%S %z}]}
+}
 
 puts "== appending =="
 set config_before [slurp $config_path]
@@ -41,6 +49,19 @@ ok "messages survive a fresh read from disk" {
     set messages [::featherweight::load_session default]
     expr {[llength $messages] == 2
         && [dict get [lindex $messages 1] content] eq {hello}}
+}
+ok "appended messages carry a Unix time" {
+    set messages [::featherweight::load_session default]
+    set time [dict get [lindex $messages 1] time]
+    expr {[string is integer -strict $time]
+        && $time > 1700000000
+        && $time <= [clock seconds]}
+}
+ok "the time is ours and is not part of the message sent to the API" {
+    set message [lindex [::featherweight::load_session default] 1]
+    set json [::featherweight::json_message $message]
+    expr {[string first {"time"} $json] < 0
+        && [string first {"content"} $json] >= 0}
 }
 
 puts "== awkward contents round trip =="
@@ -82,6 +103,13 @@ ok "switching loads that session from disk" {
 }
 ok "switching persists current_session to the config file" {
     expr {[dict get [slurp $config_path] current_session] eq {handmade}}
+}
+ok "messages written before timestamps have none" {
+    set messages [::featherweight::load_session handmade]
+    expr {[llength $messages] == 2
+        && ![dict exists [lindex $messages 0] time]
+        && [::featherweight::message_time [lindex $messages 0]] eq {}
+        && [::featherweight::message_time [lindex $messages 1]] eq {}}
 }
 
 puts "== creating a session by switching =="
@@ -146,6 +174,7 @@ set ::featherweight::config [dict create \
     endpoint http://localhost:1 \
     model test/model \
     context_size 8192 \
+    timestamp_format {%d/%m/%Y} \
     system_prompt "multi\nline {prompt} with \"quotes\"" \
     current_session default \
 ]
@@ -158,6 +187,7 @@ ok "every configuration key round trips and sessions stay out" {
         && [dict get $saved endpoint] eq {http://localhost:1}
         && [dict get $saved model] eq {test/model}
         && [dict get $saved context_size] eq {8192}
+        && [dict get $saved timestamp_format] eq {%d/%m/%Y}
         && [dict get $saved system_prompt] eq "multi\nline {prompt} with \"quotes\""
         && [dict get $saved current_session] eq {default}
         && ![dict exists $saved sessions]}

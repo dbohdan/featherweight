@@ -18,6 +18,7 @@ namespace eval ::featherweight {
         endpoint https://openrouter.ai/api/v1/chat/completions \
         model xiaomi/mimo-v2.6-flash \
         context_size 1048576 \
+        timestamp_format {%Y-%m-%d %H:%M:%S %z} \
         system_prompt {You are an expert software developer working with a user on their code.
 The user will ask for changes to the code, or ask questions about it.
 If a request is ambiguous, ask clarifying questions before making changes.
@@ -200,6 +201,12 @@ proc ::featherweight::init_config {} {
         error {context_size must be 0 (off) or an integer of at least 4096 tokens}
     }
 
+    # Used as clock format expects; a default for configurations written
+    # before it existed.
+    if {![dict exists $config timestamp_format]} {
+        dict set config timestamp_format {%Y-%m-%d %H:%M:%S %z}
+    }
+
     # The current session must name a session file; anything else starts over
     # at the default session.
     if {![dict exists $config current_session]
@@ -207,7 +214,11 @@ proc ::featherweight::init_config {} {
         dict set config current_session default
     }
 
-    set system_message [dict create role system content [dict get $config system_prompt]]
+    set system_message [dict create \
+        role system \
+        content [dict get $config system_prompt] \
+        time [clock seconds] \
+    ]
     if {[llength [current_messages]] == 0} {
         set_current_messages [list $system_message]
     }
@@ -314,7 +325,11 @@ proc ::featherweight::context_report {} {
 
 
 proc ::featherweight::harness_note {text} {
-    return [dict create role user content "\[featherweight\] $text"]
+    return [dict create \
+        role user \
+        content "\[featherweight\] $text" \
+        time [clock seconds] \
+    ]
 }
 
 
@@ -524,15 +539,25 @@ proc ::featherweight::save_config {} {
 }
 
 
+# Store one message in the current session and give it a Unix time if it does
+# not have one: a user turn, an assistant reply, a tool result. Messages written
+# before timestamps existed keep none rather than being given a false one.
+# Returns the message as stored, time included, for the caller to display.
 proc ::featherweight::append_message message {
     variable config
     variable sessions
+
+    if {![dict exists $message time]} {
+        dict set message time [clock seconds]
+    }
 
     set name [dict get $config current_session]
     load_session $name
     dict lappend sessions $name $message
 
     save_session $name
+
+    return $message
 }
 
 
@@ -661,6 +686,9 @@ proc ::featherweight::json_message message {
             }
 
             lappend fields tool_calls [::json::write array {*}$calls]
+        } elseif {$key eq {time}} {
+            # Unix time is ours, kept for the record. It is not part of the
+            # message the API expects, so it is neither sent nor counted.
         } else {
             lappend fields $key [::json::write string $value]
         }
@@ -984,7 +1012,7 @@ proc ::featherweight::debug_log {category text} {
     variable config
     variable W
     if {![dict get $config debug] && $category ni {error}} { return }
-    set ts [clock format [clock seconds] -format {%H:%M:%S}]
+    set ts [format_time [clock seconds]]
     if {[dict exists $W debug]} {
         set w [dict get $W debug]
         $w configure -state normal
@@ -1035,17 +1063,18 @@ proc ::featherweight::response_message {data} {
 }
 
 
-# Apply one assistant message to the session: show it, store it, and run the
+# Apply one assistant message to the session: store it, show it, and run the
 # tool calls it made, storing their results. Returns 1 when the turn should
 # continue with another request. The GUI's async turn and script mode's replay
-# both end here, so a tool call behaves the same way in either.
+# both end here, so a tool call behaves the same way in either. Storing comes
+# first so the message's own time is what the interface shows beside it.
 proc ::featherweight::apply_message {cleaned} {
     variable busy
 
+    set cleaned [append_message $cleaned]
     if {[dict exists $cleaned content]} {
-        ui_assistant [dict get $cleaned content]
+        ui_assistant [dict get $cleaned content] [message_time $cleaned]
     }
-    append_message $cleaned
 
     if {![dict exists $cleaned tool_calls]} {
         return 0
@@ -1053,13 +1082,38 @@ proc ::featherweight::apply_message {cleaned} {
     foreach call [dict get $cleaned tool_calls] {
         if {!$busy} { return 0 }
         debug_log tool "call: $call"
-        ui_tool_code $call
+        ui_tool_code $call [message_time $cleaned]
         set result [call_tool $call]
         if {!$busy} { return 0 }
-        append_message $result
-        ui_tool [dict get $result content]
+        set result [append_message $result]
+        ui_tool [dict get $result content] [message_time $result]
     }
     return $busy
+}
+
+
+# A Unix time as text, in the configured format. Messages store Unix time;
+# this is what turns it into a line for the interface, the debug log, and the
+# session listings.
+proc ::featherweight::format_time {time} {
+    variable config
+
+    set format {%Y-%m-%d %H:%M:%S %z}
+    if {[dict exists $config timestamp_format]} {
+        set format [dict get $config timestamp_format]
+    }
+    return [clock format $time -format $format]
+}
+
+
+# When a message was made, as a Unix time, or {} for messages written before
+# timestamps existed, which are shown without one.
+proc ::featherweight::message_time {message} {
+    if {[dict exists $message time]
+            && [string is integer -strict [dict get $message time]]} {
+        return [dict get $message time]
+    }
+    return {}
 }
 
 
@@ -1074,19 +1128,32 @@ proc ::featherweight::ui_append {tag text} {
 }
 
 
-proc ::featherweight::ui_user {text} {
-    ui_append role "You\n"
+# The heading line of a message: the label in bold, with the message's time
+# beside it in a smaller font when it has one.
+proc ::featherweight::ui_label {label time} {
+    if {$time eq {}} {
+        ui_append role "$label\n"
+        return
+    }
+    ui_append role "$label "
+    ui_append timestamp [format_time $time]
+    ui_append role "\n"
+}
+
+
+proc ::featherweight::ui_user {text {time {}}} {
+    ui_label "You" $time
     ui_append user "$text\n\n"
 }
 
 
-proc ::featherweight::ui_assistant {text} {
-    ui_append role "Assistant\n"
+proc ::featherweight::ui_assistant {text {time {}}} {
+    ui_label "Assistant" $time
     ui_append assistant "$text\n\n"
 }
 
 
-proc ::featherweight::ui_tool_code {call} {
+proc ::featherweight::ui_tool_code {call {time {}}} {
     set function [dict get $call function]
     set arguments [dict get $function arguments]
     if {[dict get $function name] eq {run_code}
@@ -1096,13 +1163,13 @@ proc ::featherweight::ui_tool_code {call} {
     } else {
         set code $arguments
     }
-    ui_append role "Tool code\n"
+    ui_label "Tool code" $time
     ui_append tool "$code\n\n"
 }
 
 
-proc ::featherweight::ui_tool {text} {
-    ui_append role "Tool\n"
+proc ::featherweight::ui_tool {text {time {}}} {
+    ui_label "Tool" $time
     ui_append tool "$text\n\n"
 }
 
@@ -1111,16 +1178,19 @@ proc ::featherweight::replay_messages {} {
     variable config
 
     set pending_tool_calls {}
+    set pending_time {}
     foreach message [current_messages] {
+        set time [message_time $message]
         switch -- [dict get $message role] {
             user {
-                ui_user [dict get $message content]
+                ui_user [dict get $message content] $time
             }
             assistant {
                 if {[dict exists $message content]} {
-                    ui_assistant [dict get $message content]
+                    ui_assistant [dict get $message content] $time
                 }
                 set pending_tool_calls {}
+                set pending_time $time
                 if {[dict exists $message tool_calls]} {
                     set pending_tool_calls [dict get $message tool_calls]
                 }
@@ -1129,11 +1199,13 @@ proc ::featherweight::replay_messages {} {
                 set id [dict get $message tool_call_id]
                 foreach call $pending_tool_calls {
                     if {[dict get $call id] eq $id} {
-                        ui_tool_code $call
+                        # The call belongs to the assistant message that made
+                        # it, so it carries that message's time.
+                        ui_tool_code $call $pending_time
                         break
                     }
                 }
-                ui_tool [dict get $message content]
+                ui_tool [dict get $message content] $time
             }
         }
     }
@@ -1200,8 +1272,8 @@ proc ::featherweight::submit {} {
     if {$text eq {}} { return }
     $entry delete 1.0 end
     if {[handle_slash_command $text]} { return }
-    append_message [dict create role user content $text]
-    ui_user $text
+    set message [append_message [dict create role user content $text]]
+    ui_user $text [message_time $message]
     set_ui_busy 1
     request_async
 }
@@ -1243,6 +1315,7 @@ proc ::featherweight::switch_session name {
             [dict create \
                 role system \
                 content [dict get $config system_prompt] \
+                time [clock seconds] \
             ] \
         ]
         save_session $name
@@ -1615,6 +1688,17 @@ proc ::featherweight::build_ui {} {
     set chat [dict get $W chat]
     font create ::featherweight::role_font  {*}[font configure TkTextFont]  -weight bold
     $chat tag configure role -font ::featherweight::role_font -foreground #555555
+    # Timestamps sit beside the label in a smaller font. The sign convention
+    # for -size differs between platforms, but either way taking two off the
+    # magnitude shrinks the font.
+    font create ::featherweight::timestamp_font {*}[font configure TkTextFont]
+    set size [font configure ::featherweight::timestamp_font -size]
+    if {$size > 2} {
+        font configure ::featherweight::timestamp_font -size [expr {$size - 2}]
+    } elseif {$size < -2} {
+        font configure ::featherweight::timestamp_font -size [expr {$size + 2}]
+    }
+    $chat tag configure timestamp -font ::featherweight::timestamp_font -foreground #555555
     $chat tag configure user -foreground #0b57d0
     $chat tag configure assistant -foreground #1b5e20
     $chat tag configure tool -foreground #6a1b9a
@@ -2030,8 +2114,13 @@ proc ::featherweight::session_show {name last} {
     }
     for {set index $from} {$index < $count} {incr index} {
         set message [lindex $messages $index]
+        set header "$index [dict get $message role]"
+        set time [message_time $message]
+        if {$time ne {}} {
+            append header " [format_time $time]"
+        }
         ::puts stdout {}
-        ::puts stdout "$index [dict get $message role]"
+        ::puts stdout $header
         if {[dict exists $message content]} {
             ::puts stdout [dict get $message content]
         }

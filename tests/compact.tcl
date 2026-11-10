@@ -55,6 +55,9 @@ ok "the automatic fold is on disk" {
 ok "the automatic fold logs itself" {
     expr {[string first {compacted history: dropped} [slurp $log_path]] >= 0}
 }
+ok "the debug log uses the configured timestamp format" {
+    regexp {\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4} \(tool\)} [slurp $log_path]
+}
 ok "a second automatic pass has nothing left to do" {
     expr {[::featherweight::compact_context] == 0
         && [::featherweight::messages_tokens [::featherweight::current_messages]]

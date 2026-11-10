@@ -60,9 +60,10 @@ ok "session list names the stored sessions" {
         && [string first {default} [dict get $r output]] >= 0}
 }
 set r [run_cli {debug session show default}]
-ok "session show prints the messages" {
+ok "session show prints each message with its time" {
     expr {[dict get $r code] == 0
-        && [string first {0 system} [dict get $r output]] >= 0}
+        && [string first {0 system} [dict get $r output]] >= 0
+        && [regexp {\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}} [dict get $r output]]}
 }
 set r [run_cli {debug session show nosuch}]
 ok "session show of a missing session exits 1" {
