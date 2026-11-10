@@ -65,6 +65,11 @@ check "the input is the third pane of the same panedwindow" \
     {[llength [.root.pane panes]] == 3 && {.root.input} in [.root.pane panes]}
 check "the Send button fills the height of the input" \
     {[dict get [pack info .root.input.send] -fill] in {y both}}
+set sash_gap [expr {[.root.pane sashpos 1]
+    - [winfo height .root.pane.chatf]
+    - [winfo height .root.pane.dbgf]}]
+check "the gap beside the button matches the sash height" \
+    {$sash_gap > 0 && [dict get [pack info .root.input.send] -padx] eq [list $sash_gap 0]}
 check "the window title names the directory and the model" \
     {[wm title .] eq "Featherweight - [file tail [pwd]]/ - [dict get $::featherweight::config model]"}
 ::featherweight::handle_slash_command {/model title/model}

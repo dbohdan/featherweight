@@ -1675,16 +1675,28 @@ proc ::featherweight::build_ui {} {
     .root.pane add .root.pane.dbgf -weight 2
 
     # The input is the third pane of the same panedwindow as Conversation and
-    # Debug, so the sash above it sets its height. The padding keeps it off
-    # that sash, and the button fills the pane's height beside the text.
+    # Debug, so the sash above it sets its height. The padding keeps it clear
+    # of that sash, and the button fills the pane's height beside the text.
     ttk::frame .root.input -padding {0 6 0 0}
     text .root.input.e -wrap word -height 4 -width 40 -undo 1
     bind .root.input.e <Control-Return> {::featherweight::submit; break}
     bind .root.input.e <Control-KP_Enter> {::featherweight::submit; break}
     ttk::button .root.input.send -text "Send" -command ::featherweight::submit_or_stop
-    pack .root.input.send -side right -fill y -padx {4 0}
     pack .root.input.e -side left -fill both -expand 1
     .root.pane add .root.input -weight 1
+
+    # The gap between the input and the button is the height of the sash above
+    # them, so the vertical and horizontal spacing read as one measurement.
+    # The sash is only in the geometry once the window is mapped, hence the
+    # update; a window that cannot be measured falls back to 6.
+    update
+    set gap [expr {[.root.pane sashpos 1]
+        - [winfo height .root.pane.chatf]
+        - [winfo height .root.pane.dbgf]}]
+    if {$gap < 1} {
+        set gap 6
+    }
+    pack .root.input.send -side right -fill y -padx [list $gap 0]
 
     ttk::label .root.status -text "Ready" -anchor w
     pack .root.status -fill x
