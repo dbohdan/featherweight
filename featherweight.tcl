@@ -1013,6 +1013,9 @@ namespace eval ::featherweight {
     variable done 0
     # How many times the current request has been sent again after a failure.
     variable retry_count 0
+    # Collapsible debug entries: their number, and which of them are open.
+    variable debug_entry 0
+    array set debug_open {}
     variable request_channels
     array set request_channels {}
 }
@@ -1029,15 +1032,37 @@ proc ::featherweight::pretty {raw} {
 
 
 
-proc ::featherweight::debug_log {category text} {
+proc ::featherweight::debug_log {category text {label {}}} {
     variable config
     variable W
+    variable debug_entry
+    variable debug_open
     if {![dict get $config debug] && $category ni {error}} { return }
     set ts [format_time [clock seconds]]
     if {[dict exists $W debug]} {
         set w [dict get $W debug]
         $w configure -state normal
-        $w insert end "$ts ($category) $text\n" [list "cat_$category"]
+        if {$category in {request response} || $label ne {}} {
+            # Something long: show the header and fold the body away the way
+            # an HTML details element does. The label names the entry -- the
+            # tool a call is for -- so the log stays navigable without
+            # clicking. The marker opens it again.
+            incr debug_entry
+            set n $debug_entry
+            set debug_open($n) 0
+            set head "$ts ($category)"
+            if {$label ne {}} {
+                append head " $label"
+            }
+            $w insert end "$head " [list cat_$category]
+            $w insert end {[+]} [list cat_$category dbg_toggle toggle$n]
+            $w insert end "\n" [list cat_$category]
+            $w insert end "$text\n" [list cat_$category body$n]
+            $w tag configure body$n -elide 1
+            $w tag bind toggle$n <Button-1> [list [namespace current]::debug_toggle $w $n]
+        } else {
+            $w insert end "$ts ($category) $text\n" [list "cat_$category"]
+        }
         $w configure -state disabled
         $w see end
         return
@@ -1047,6 +1072,36 @@ proc ::featherweight::debug_log {category text} {
         ::puts $fh "$ts ($category) $text"
         close $fh
     }]} {}
+}
+
+
+# Open or close one folded debug entry. The marker is three characters wide
+# either way, so nothing below it moves when it is clicked.
+proc ::featherweight::debug_toggle {w n} {
+    variable debug_open
+
+    set open 0
+    if {[info exists debug_open($n)]} {
+        set open $debug_open($n)
+    }
+    $w configure -state normal
+    if {$open} {
+        $w tag configure body$n -elide 1
+        set marker {[+]}
+    } else {
+        $w tag configure body$n -elide 0
+        set marker {[-]}
+    }
+    set ranges [$w tag ranges toggle$n]
+    if {[llength $ranges] >= 2} {
+        lassign $ranges start end
+        set tags [$w tag names $start]
+        $w delete $start $end
+        $w insert $start $marker $tags
+        $w see $start
+    }
+    set debug_open($n) [expr {!$open}]
+    $w configure -state disabled
 }
 
 
@@ -1102,7 +1157,9 @@ proc ::featherweight::apply_message {cleaned} {
     }
     foreach call [dict get $cleaned tool_calls] {
         if {!$busy} { return 0 }
-        debug_log tool "call: $call"
+        set name {}
+        catch {set name [dict get $call function name]}
+        debug_log tool "call: $call" $name
         ui_tool_code $call [message_time $cleaned]
         set result [call_tool $call]
         if {!$busy} { return 0 }
@@ -1807,6 +1864,9 @@ proc ::featherweight::build_ui {} {
     $dbg tag configure cat_request -foreground #4fc3f7
     $dbg tag configure cat_response -foreground #a5d6a7
     $dbg tag configure cat_tool -foreground #ce93d8
+    # The [+] / [-] of a folded entry: underlined, since it is the only thing
+    # in the log that responds to a click.
+    $dbg tag configure dbg_toggle -underline 1
 
     install_text_context_menu [dict get $W chat]
     install_text_context_menu [dict get $W debug]

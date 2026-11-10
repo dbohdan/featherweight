@@ -172,6 +172,53 @@ $chat configure -state disabled
 check "a message with no time is shown without a timestamp" \
     {[string trim [$chat get 1.0 end]] eq "You\nuntimed"}
 
+# A request or response entry is folded to its header, with a marker that
+# opens and closes it again.
+set dbg [dict get $::featherweight::W debug]
+::featherweight::debug_log request "{\n  \"payload\": true\n}"
+set bodies {}
+foreach tag [$dbg tag names] {
+    if {[string match body* $tag]} { lappend bodies $tag }
+}
+set body [lindex $bodies end]
+set n [string range $body 4 end]
+check "a request is logged folded to its header" \
+    {[string first {(request) [+]} [$dbg get 1.0 end]] >= 0
+        && [string first {payload} [$dbg get 1.0 end]] >= 0
+        && [tag_value $dbg $body -elide]}
+::featherweight::debug_toggle $dbg $n
+check "the marker opens it" \
+    {![tag_value $dbg $body -elide]
+        && [string first {(request) [-]} [$dbg get 1.0 end]] >= 0}
+::featherweight::debug_toggle $dbg $n
+check "and closes it again" \
+    {[tag_value $dbg $body -elide]
+        && [string first {(request) [+]} [$dbg get 1.0 end]] >= 0}
+check "the marker is bound to the toggle" \
+    {[string first {debug_toggle} [$dbg tag bind toggle$n <Button-1>]] >= 0}
+
+# A tool call is folded too, with the tool name in its header; a tool note
+# stays visible, since there is nothing to fold.
+set call [dict create type function id run_code:0 \
+    function [dict create name run_code arguments {"code": "puts hi"}]]
+::featherweight::debug_log tool "call: $call" run_code
+set bodies {}
+foreach tag [$dbg tag names] {
+    if {[string match body* $tag]} { lappend bodies $tag }
+}
+set body [lindex $bodies end]
+check "a tool call is folded with its name in the header" \
+    {[string first {(tool) run_code [+]} [$dbg get 1.0 end]] >= 0
+        && [tag_value $dbg $body -elide]}
+set folded_count [llength $bodies]
+::featherweight::debug_log tool {model set to test/model}
+set bodies {}
+foreach tag [$dbg tag names] {
+    if {[string match body* $tag]} { lappend bodies $tag }
+}
+check "a tool note stays visible" \
+    {[llength $bodies] == $folded_count}
+
 # A request the network drops is sent again, and gives up after the configured
 # number of retries. The endpoint is a dead port, so curl fails locally and
 # nothing leaves the machine.
