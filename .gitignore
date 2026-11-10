@@ -2,6 +2,7 @@
 
 featherweight.conf
 /featherweight/
+/tests/.tmp/
 *.bak*
 *.sw*
 *.log

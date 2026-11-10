@@ -14,3 +14,22 @@ Maintain `LOG.md` as the handoff between sessions.
   attribution, rather than replacing previous entries.
 - Keep the log concise and useful to the next session; do not log secrets, API keys, or
   other credentials.
+
+## Commits
+
+Only commit when the user asks you to.
+
+- Stage the files you touched, by name: `git add <path> ...`. Do not stage unrelated
+  files, and never stage what `.gitignore` covers (`featherweight/`, `tests/.tmp/`,
+  `*.log`, `*.bak*`).
+- Commit with a signed trailer naming the model that did the work:
+
+  ```
+  git commit -S --trailer 'Assisted-by: [model] via Featherweight'
+  ```
+
+  Replace `[model]` with the model's name as it is written at the top of `LOG.md`, for
+  example `Assisted-by: MiMo-V2.6-Flash via Featherweight`. If signing fails, say so
+  rather than committing unsigned.
+- Use the repository's conventional message style: a subject of the form
+  `type(scope): summary`, and a short body saying what changed and why.

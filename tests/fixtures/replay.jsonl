@@ -1,0 +1,2 @@
+{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"replay-1","type":"function","function":{"name":"about","arguments":"{}"}}]}}]}
+{"choices":[{"message":{"role":"assistant","content":"The replayed turn is over."}}]}

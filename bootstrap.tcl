@@ -33,6 +33,11 @@ Use run_code for other operations in the user's environment.} \
     # not in here has not been looked at yet; see load_session.
     variable sessions [dict create]
 
+    # Where the state directory is when script mode has moved it: a replayed
+    # turn runs against a throwaway copy so the real sessions stay untouched.
+    # Empty means the ordinary launch-directory state.
+    variable state_root {}
+
     variable run_code_output {}
     variable tools_available [subst {
         run_code {
@@ -80,8 +85,14 @@ Use run_code for other operations in the user's environment.} \
 
 
 # The directory that holds the configuration and the sessions, relative to the
-# project root (the launch directory).
+# project root (the launch directory) -- or wherever script mode has pointed
+# it, for a turn replayed against a copy of the state.
 proc ::featherweight::state_dir {} {
+    variable state_root
+
+    if {$state_root ne {}} {
+        return $state_root
+    }
     return [file join [pwd] featherweight]
 }
 
@@ -346,19 +357,33 @@ proc ::featherweight::set_current_messages messages {
 }
 
 
-# Fold the current session's history so it fits the context budget; called
-# before every request. With $force (/compact) it folds even when the history
-# already fits, aiming at half of what is there instead of at half the budget,
-# and never higher than the automatic target -- so a forced fold cannot leave
-# the session over a window the automatic rule would have respected.
-proc ::featherweight::compact_context {{force 0}} {
+# Work out what a fold would do, without doing it. Returns a dict holding:
+#   fold       1 when a fold would happen, 0 when it would not
+#   why        why not: off, fits, no-turn, no-gain
+#   before     the history's tokens now; after, what it would be left with
+#   cut        the message the fold would start from (when it would fold)
+#   note       the note that would stand in for the dropped messages
+#   said       the user texts that note would quote
+#   compacted  the messages the session would then hold
+#   target     the token count the cut is chosen against
+# Pure: it reads the session and writes nothing, so /compact, debug fold and
+# debug request can all ask the same question and get the same answer.
+proc ::featherweight::fold_plan {{force 0}} {
     set messages [current_messages]
     set before [messages_tokens $messages]
     set budget [history_budget]
-    if {!$force && ($budget == 0 || $before <= $budget)} {
-        return 0
+    if {!$force} {
+        if {$budget == 0} {
+            return [dict create fold 0 why off before $before]
+        }
+        if {$before <= $budget} {
+            return [dict create fold 0 why fits before $before]
+        }
     }
 
+    # A forced fold aims at half of what is there rather than at half the
+    # budget, and never higher than the automatic target -- it cannot leave
+    # the session over a window the automatic rule would have respected.
     if {$force} {
         set target [expr {$before / 2}]
         if {$budget > 0} {
@@ -400,29 +425,66 @@ proc ::featherweight::compact_context {{force 0}} {
         set note [roll_note $said]
     }
     if {$cut < 0} {
-        if {$force} {
-            debug_log tool {context not folded: the session has no user turn to cut at}
-        }
-        return 0
+        return [dict create fold 0 why no-turn before $before target $target]
     }
 
     set before_count [llength $messages]
     set compacted [list [lindex $messages 0] $note {*}[lrange $messages $cut end]]
     set after [messages_tokens $compacted]
     if {$after >= $before} {
+        return [dict create fold 0 why no-gain before $before after $after \
+            cut $cut said $said note $note before_count $before_count \
+            target $target compacted $compacted]
+    }
+    return [dict create fold 1 why done before $before after $after cut $cut \
+        said $said note $note before_count $before_count target $target \
+        compacted $compacted]
+}
+
+
+# Why a fold would not happen, in words. compact_context prefixes this with
+# "context not folded: "; debug fold reports it on its own.
+proc ::featherweight::fold_decline {plan} {
+    switch -- [dict get $plan why] {
+        off {
+            return {automatic folding is off (context_size is 0)}
+        }
+        fits {
+            return {the history already fits the context budget}
+        }
+        no-turn {
+            return {the session has no user turn to cut at}
+        }
+        no-gain {
+            return "keeping the latest turn whole and quoting the user's words verbatim would leave approximately [dict get $plan after] tokens, at least as many as the [dict get $plan before] it has now"
+        }
+        default {
+            return [dict get $plan why]
+        }
+    }
+}
+
+
+# Fold the current session's history so it fits the context budget; called
+# before every request. With $force (/compact) it folds even when the history
+# already fits, and reports a fold it cannot do instead of staying quiet.
+proc ::featherweight::compact_context {{force 0}} {
+    set plan [fold_plan $force]
+    if {![dict get $plan fold]} {
         if {$force} {
-            debug_log tool "context not folded: keeping the latest turn whole\
-                and quoting the user's words verbatim would leave approximately\
-                $after tokens, at least as many as the $before it has now"
+            debug_log tool "context not folded: [fold_decline $plan]"
         }
         return 0
     }
-    set_current_messages $compacted
+
+    set_current_messages [dict get $plan compacted]
     set label {compacted history}
     if {$force} {
         set label {folded on request}
     }
-    debug_log tool "$label: dropped [expr {$cut - 1}] of [expr {$before_count - 1}] messages ($before -> $after tokens); user messages kept verbatim"
+    set cut [dict get $plan cut]
+    set before_count [dict get $plan before_count]
+    debug_log tool "$label: dropped [expr {$cut - 1}] of [expr {$before_count - 1}] messages ([dict get $plan before] -> [dict get $plan after] tokens); user messages kept verbatim"
     refresh_session
     return 1
 }
@@ -901,7 +963,6 @@ namespace eval ::featherweight {
     variable W {}
     variable json_tools {}
     variable busy 0
-    variable tok {}
     variable done 0
     variable request_channels
     array set request_channels {}
@@ -952,6 +1013,53 @@ proc ::featherweight::clean_assistant_message {msg} {
         dict set out tool_calls [dict get $msg tool_calls]
     }
     return $out
+}
+
+
+# Turn a response body into the assistant message to store, or fail with a
+# message saying what was wrong with it. The GUI's turn and script mode's
+# replay both read responses through this, so a malformed answer is reported
+# the same way in either.
+proc ::featherweight::response_message {data} {
+    if {[catch {json::json2dict $data} response]} {
+        error "JSON decode failed: $response"
+    }
+    if {![dict exists $response choices] || [llength [dict get $response choices]] == 0} {
+        error {response has no choices}
+    }
+    set choice [lindex [dict get $response choices] 0]
+    if {![dict exists $choice message]} {
+        error {choice has no message}
+    }
+    return [clean_assistant_message [dict get $choice message]]
+}
+
+
+# Apply one assistant message to the session: show it, store it, and run the
+# tool calls it made, storing their results. Returns 1 when the turn should
+# continue with another request. The GUI's async turn and script mode's replay
+# both end here, so a tool call behaves the same way in either.
+proc ::featherweight::apply_message {cleaned} {
+    variable busy
+
+    if {[dict exists $cleaned content]} {
+        ui_assistant [dict get $cleaned content]
+    }
+    append_message $cleaned
+
+    if {![dict exists $cleaned tool_calls]} {
+        return 0
+    }
+    foreach call [dict get $cleaned tool_calls] {
+        if {!$busy} { return 0 }
+        debug_log tool "call: $call"
+        ui_tool_code $call
+        set result [call_tool $call]
+        if {!$busy} { return 0 }
+        append_message $result
+        ui_tool [dict get $result content]
+    }
+    return $busy
 }
 
 
@@ -1336,51 +1444,18 @@ proc ::featherweight::request_readable ch {
         return
     }
 
-    if {[catch {json::json2dict $data} response]} {
-        debug_log error "JSON decode failed: $response"
+    if {[catch {response_message $data} cleaned]} {
+        debug_log error $cleaned
         set_ui_busy 0
         return
     }
 
-    if {![dict exists $response choices] || [llength [dict get $response choices]] == 0} {
-        debug_log error {response has no choices}
-        set_ui_busy 0
-        return
-    }
-
-    set choice [lindex [dict get $response choices] 0]
-    if {![dict exists $choice message]} {
-        debug_log error "choice has no message"
-        set_ui_busy 0
-        return
-    }
-
-    set raw [dict get $choice message]
-    set cleaned [clean_assistant_message $raw]
-
-    if {[dict exists $cleaned content]} {
-        ui_assistant [dict get $cleaned content]
-    }
-
-    append_message $cleaned
-
-    if {[dict exists $cleaned tool_calls]} {
-        foreach call [dict get $cleaned tool_calls] {
-            if {!$busy} { return }
-            debug_log tool "call: $call"
-            ui_tool_code $call
-            set result [call_tool $call]
-            if {!$busy} { return }
-            append_message $result
-            ui_tool [dict get $result content]
-        }
+    if {[apply_message $cleaned]} {
         request_async
         return
     }
 
     set_ui_busy 0
-
-
 }
 
 
@@ -1560,75 +1635,602 @@ proc ::featherweight::build_ui {} {
 
 
 
-proc ::featherweight::console_main {} {
-    variable config
+proc ::featherweight::usage {} {
+    return {Usage: tclsh bootstrap.tcl [debug <subcommand> [options]]
+       tclsh bootstrap.tcl --help
+
+With no arguments, the Tk interface starts.
+
+Script mode reads state and prints it. It never sends a request; loading
+the state creates missing files the way starting the interface does, and
+only debug eval can change what is stored:
+  debug request [--session name] [--last n] [--replay file] [--keep]
+      Print the request that would go out: model, endpoint, message
+      history, tool schemas, approximate tokens. --last n lists the last
+      n messages instead of printing the whole payload. --replay file
+      runs one turn from recorded responses -- one response body per
+      line -- against a throwaway copy of the state; the recorded tools
+      still run for real.
+  debug fold [--force]
+      Show what a context fold would cut, without cutting it. --force is
+      what /compact does.
+  debug session list
+  debug session show <name> [--last n]
+  debug session check
+      List the stored sessions, print one, or validate every session
+      file and the configuration. check exits non-zero on a problem.
+  debug eval <tcl-code>
+      Evaluate Tcl in the Featherweight namespace and print what it
+      printed and what it returned. This one can change state.
+  debug selftest
+      Run the scripts in tests/. Exits non-zero if any of them fails.}
+}
+
+
+proc ::featherweight::usage_error {message} {
+    ::puts stderr $message
+    ::puts stderr {}
+    ::puts stderr [usage]
+    exit 2
+}
+
+
+# One line describing a message, for the listings.
+proc ::featherweight::message_summary {message} {
+    if {[dict exists $message content] && [dict get $message content] ne {}} {
+        set text [string map [list "\n" " "] [dict get $message content]]
+        if {[string length $text] > 120} {
+            set text "[string range $text 0 119]..."
+        }
+        return $text
+    }
+    if {[dict exists $message tool_calls]} {
+        set names {}
+        foreach call [dict get $message tool_calls] {
+            lappend names [dict get [dict get $call function] name]
+        }
+        return "tool calls: [join $names {, }]"
+    }
+    return {}
+}
+
+
+# Script mode: tclsh bootstrap.tcl debug <subcommand> ...
+proc ::featherweight::script_main {argv} {
     variable json_tools
     variable tools_available
 
-    set json_tools [lmap tool_args [dict values $tools_available]] {
-        json_tool {*}$tool_args
-    }]
-    ::puts "Featherweight console mode (type a message; Ctrl-D to exit)"
-    while {[gets stdin line] >= 0} {
-        if {[string trim $line] eq {}} { continue }
-        if {[handle_slash_command $line]} { continue }
-        append_message [dict create role user content $line]
-        console_turn
+    set command [lindex $argv 0]
+    if {$command in {-h --help help}} {
+        ::puts stdout [usage]
+        exit 0
+    }
+    if {$command ne {debug}} {
+        usage_error "unknown option: $command"
+    }
+
+    set argv [lrange $argv 1 end]
+    if {[llength $argv] == 0} {
+        usage_error {debug needs a subcommand}
+    }
+    set sub [lindex $argv 0]
+    set options [lrange $argv 1 end]
+
+    if {$sub ni {request fold session eval selftest}} {
+        usage_error "unknown subcommand: $sub"
+    }
+
+    # selftest needs no state; session reads it the way inspection should,
+    # tolerating damage it has to report. The rest load it up front.
+    if {$sub in {request fold eval}} {
+        if {[catch {init_config} error]} {
+            ::puts stderr "Error: $error"
+            exit 1
+        }
+        set json_tools {}
+        dict for {_name tool_args} $tools_available {
+            lappend json_tools [json_tool {*}$tool_args]
+        }
+    }
+
+    if {[catch {set code [script_$sub $options]} error]} {
+        ::puts stderr "Error: $error"
+        exit 1
+    }
+    exit $code
+}
+
+
+# The request that would go out for a session, with no network.
+proc ::featherweight::script_request {options} {
+    variable config
+    variable json_tools
+
+    set session {}
+    set last 0
+    set replay {}
+    set keep 0
+    while {[llength $options]} {
+        set option [lindex $options 0]
+        set options [lrange $options 1 end]
+        switch -- $option {
+            --session {
+                if {[llength $options] == 0} { usage_error {--session needs a name} }
+                set session [lindex $options 0]
+                set options [lrange $options 1 end]
+            }
+            --last {
+                if {[llength $options] == 0} { usage_error {--last needs a number} }
+                set last [lindex $options 0]
+                set options [lrange $options 1 end]
+                if {![string is integer -strict $last] || $last < 1} {
+                    usage_error {--last needs a positive number}
+                }
+            }
+            --replay {
+                if {[llength $options] == 0} { usage_error {--replay needs a file} }
+                set replay [lindex $options 0]
+                set options [lrange $options 1 end]
+            }
+            --keep { set keep 1 }
+            default { usage_error "unknown option: $option" }
+        }
+    }
+
+    if {$replay ne {}} {
+        if {$last > 0} { usage_error {--last does not apply with --replay} }
+        return [replay_turn $replay $session $keep]
+    }
+
+    # Look at another session without making it the current one. Nothing
+    # here is saved, so the switch lives only in this process.
+    set saved [dict get $config current_session]
+    if {$session ne {}} {
+        if {![session_exists $session]} {
+            error "no such session: $session"
+        }
+        dict set config current_session $session
+    }
+
+    # The same question prepare_request asks -- would a fold run first? --
+    # answered without writing anything.
+    set plan [fold_plan]
+    set messages [current_messages]
+    set fold_line "automatic fold: would not run: [fold_decline $plan]"
+    if {[dict get $plan fold]} {
+        set messages [dict get $plan compacted]
+        set fold_line "automatic fold: would cut at message [dict get $plan cut] of [dict get $plan before_count], [dict get $plan before] -> [dict get $plan after] tokens"
+    }
+
+    set size [dict get $config context_size]
+    set history [messages_tokens $messages]
+    set tools [tools_tokens $json_tools]
+    set total [expr {$history + $tools}]
+
+    ::puts stdout "session:  [current_session_name]"
+    ::puts stdout "model:    [dict get $config model]"
+    ::puts stdout "endpoint: [dict get $config endpoint]"
+    ::puts stdout "history:  [llength $messages] messages, $history tokens"
+    ::puts stdout "tools:    [llength $json_tools] schemas, $tools tokens"
+    if {$size > 0} {
+        ::puts stdout [format {context:  %d of %d tokens (%.1f%%); fold above %d history tokens} \
+            $total $size [expr {100.0 * $total / $size}] [history_budget]]
+    } else {
+        ::puts stdout "context:  $total tokens; automatic folding is off"
+    }
+    ::puts stdout $fold_line
+    dict set config current_session $saved
+
+    if {$last > 0} {
+        set count [llength $messages]
+        set from [expr {max(0, $count - $last)}]
+        ::puts stdout {}
+        ::puts stdout "last [expr {$count - $from}] of $count messages:"
+        for {set index $from} {$index < $count} {incr index} {
+            set message [lindex $messages $index]
+            ::puts stdout [format {%4d %-9s %s} $index \
+                [dict get $message role] [message_summary $message]]
+        }
+        return 0
+    }
+
+    set payload [json_payload [dict get $config model] $json_tools $messages]
+    ::puts stdout {}
+    ::puts stdout $payload
+    return 0
+}
+
+
+# Run one whole turn against a queue of recorded responses instead of the
+# network. The state is copied first, so the real sessions are untouched; the
+# tools the recorded turn calls still run for real, against the project.
+proc ::featherweight::replay_turn {file session keep} {
+    variable state_root
+
+    set channel [open $file r]
+    fconfigure $channel -encoding utf-8
+    set responses {}
+    while {[gets $channel line] >= 0} {
+        set line [string trim $line]
+        if {$line ne {}} { lappend responses $line }
+    }
+    close $channel
+    if {[llength $responses] == 0} {
+        error "replay file holds no responses: $file"
+    }
+
+    set handle [file tempfile path]
+    close $handle
+    file delete -force $path
+    file mkdir $path
+    set copy [file join $path featherweight]
+    file copy -force [state_dir] $copy
+    set state_root $copy
+
+    if {[catch {init_config} error]} {
+        file delete -force $path
+        error "could not load the copied state: $error"
+    }
+    if {$session ne {}} {
+        switch_session $session
+    }
+
+    ::puts stdout "replay: [llength $responses] recorded responses; state copied to $copy"
+    ::puts stdout "replay: the recorded tools run for real against the project."
+
+    set_ui_busy 1
+    set requests 0
+    set index 0
+    while 1 {
+        if {[catch {prepare_request} messages]} {
+            set_ui_busy 0
+            file delete -force $path
+            error $messages
+        }
+        incr requests
+        ::puts stdout "request $requests: [llength $messages] messages, [messages_tokens $messages] tokens"
+
+        if {$index >= [llength $responses]} {
+            ::puts stdout "replay: the queue ran out after $requests requests"
+            break
+        }
+        set body [lindex $responses $index]
+        incr index
+
+        if {[catch {response_message $body} cleaned]} {
+            set_ui_busy 0
+            file delete -force $path
+            error "response $index: $cleaned"
+        }
+        if {[dict exists $cleaned content]} {
+            ::puts stdout "  assistant: [message_summary $cleaned]"
+        }
+        if {[dict exists $cleaned tool_calls]} {
+            foreach call [dict get $cleaned tool_calls] {
+                set function [dict get $call function]
+                ::puts stdout "  tool call: [dict get $function name] [dict get $function arguments]"
+            }
+        }
+
+        set before [llength [current_messages]]
+        set more [apply_message $cleaned]
+        set now [current_messages]
+        for {set index2 $before} {$index2 < [llength $now]} {incr index2} {
+            set message [lindex $now $index2]
+            if {[dict get $message role] eq {tool}} {
+                ::puts stdout "  result: [message_summary $message]"
+            }
+        }
+
+        if {!$more} { break }
+    }
+    set_ui_busy 0
+
+    set messages [current_messages]
+    ::puts stdout "replay: turn over after $requests requests; [llength $messages] messages, [messages_tokens $messages] tokens"
+    if {$keep} {
+        ::puts stdout "replay: kept the copied state at $path"
+    } else {
+        file delete -force $path
+    }
+    return 0
+}
+
+
+# What a context fold would do, without doing it.
+proc ::featherweight::script_fold {options} {
+    variable config
+
+    set force 0
+    while {[llength $options]} {
+        set option [lindex $options 0]
+        set options [lrange $options 1 end]
+        switch -- $option {
+            --force { set force 1 }
+            default { usage_error "unknown option: $option" }
+        }
+    }
+
+    set kind {automatic fold}
+    if {$force} {
+        set kind {forced fold (/compact)}
+    }
+
+    set plan [fold_plan $force]
+    set size [dict get $config context_size]
+    ::puts stdout "session: [current_session_name] ([llength [current_messages]] messages, context_size $size)"
+    if {[dict get $plan fold]} {
+        set cut [dict get $plan cut]
+        set before_count [dict get $plan before_count]
+        ::puts stdout "$kind: would cut at message $cut of $before_count, dropping [expr {$cut - 1}] messages"
+        ::puts stdout "  [dict get $plan before] -> [dict get $plan after] tokens, against a target of [dict get $plan target]"
+        ::puts stdout "  the note would quote [llength [dict get $plan said]] user messages and start: [message_summary [dict get $plan note]]"
+    } else {
+        ::puts stdout "$kind: would not run: [fold_decline $plan]"
+    }
+    ::puts stdout {nothing is written; /compact in the interface applies the fold.}
+    return 0
+}
+
+
+# Load the state the way starting the interface would, but keep going when it
+# is damaged: session list and session check exist to report that damage.
+proc ::featherweight::load_state_for_inspection {} {
+    if {[catch {init_config} error]} {
+        ::puts stderr "warning: could not load the state: $error"
+        return $error
+    }
+    return {}
+}
+
+
+proc ::featherweight::session_list {} {
+    variable config
+
+    set current {}
+    if {[dict exists $config current_session]} {
+        set current [dict get $config current_session]
+    }
+
+    set names [session_names]
+    if {[llength $names] == 0} {
+        ::puts stdout {no sessions yet}
+        return
+    }
+    foreach name $names {
+        set mark " "
+        if {$name eq $current} { set mark "*" }
+        set path [session_path $name]
+        if {[catch {read_session $name} messages]} {
+            ::puts stdout [format {%s %-20s %10d bytes  unreadable: %s} \
+                $mark $name [file size $path] $messages]
+            continue
+        }
+        ::puts stdout [format {%s %-20s %6d messages %8d tokens %10d bytes} \
+            $mark $name [llength $messages] [messages_tokens $messages] [file size $path]]
     }
 }
 
 
-proc ::featherweight::console_turn {} {
-    variable config
-    variable json_tools
-    variable tok
-    while 1 {
-        if {[catch {prepare_request} messages]} {
-            ::puts "Error: $messages"
-            return
+proc ::featherweight::session_show {name last} {
+    if {![session_exists $name]} {
+        error "no such session: $name"
+    }
+    set messages [load_session $name]
+
+    set count [llength $messages]
+    set from 0
+    if {$last > 0} {
+        set from [expr {max(0, $count - $last)}]
+    }
+    if {$from > 0} {
+        ::puts stdout "$name ($count messages; showing the last $last)"
+    } else {
+        ::puts stdout "$name ($count messages)"
+    }
+    for {set index $from} {$index < $count} {incr index} {
+        set message [lindex $messages $index]
+        ::puts stdout {}
+        ::puts stdout "$index [dict get $message role]"
+        if {[dict exists $message content]} {
+            ::puts stdout [dict get $message content]
         }
-        set payload [json_payload [dict get $config model] $json_tools $messages]
-        debug_log request [pretty $payload]
-        if {[catch {
-            set tok [::http::geturl [dict get $config endpoint]\
-                -method POST\
-                -type application/json\
-                -headers [list Authorization "Bearer [api_key]"]\
-                -query $payload]
-            set status [::http::ncode $tok]
-            set data [::http::data $tok]
-        } err]} {
-            ::puts "Error: $err"
-            return
-        }
-        catch {::http::cleanup $tok}
-        if {$status != 200} {
-            ::puts "Error: HTTP $status"
-            debug_log error "HTTP $status: $data"
-            return
-        }
-        if {[catch {json::json2dict $data} response]} {
-            ::puts "Error: response was not valid JSON"
-            return
-        }
-        if {![dict exists $response choices] || [llength [dict get $response choices]] == 0} {
-            ::puts "Error: response had no choices"
-            return
-        }
-        set choice [lindex [dict get $response choices] 0]
-        set cleaned [clean_assistant_message [dict get $choice message]]
-        if {[dict exists $cleaned content]} {
-            ::puts "Assistant: [dict get $cleaned content]"
-        }
-        append_message $cleaned
-        if {![dict exists $cleaned tool_calls]} { return }
-        foreach call [dict get $cleaned tool_calls] {
-            debug_log tool "call: $call"
-            set result [call_tool $call]
-            ::puts "Tool: [dict get $result content]"
-            append_message $result
+        if {[dict exists $message tool_calls]} {
+            foreach call [dict get $message tool_calls] {
+                set function [dict get $call function]
+                ::puts stdout "tool call: [dict get $function name] [dict get $function arguments]"
+            }
         }
     }
+}
+
+
+# Validate the configuration and every session file. Returns how many problems
+# it found; nothing is written.
+proc ::featherweight::session_check {} {
+    variable config
+
+    set problems 0
+
+    set path [config_path]
+    if {![file exists $path]} {
+        ::puts stderr "config: $path does not exist"
+        incr problems
+    } elseif {[catch {
+        dict size [::fileutil::cat -encoding utf-8 $path]
+    } error]} {
+        ::puts stderr "config: $path: $error"
+        incr problems
+    } else {
+        ::puts stdout "config: ok ($path)"
+    }
+
+    foreach name [session_names] {
+        set path [session_path $name]
+        if {[catch {read_session $name} messages]} {
+            ::puts stderr "session $name: $messages"
+            incr problems
+        } else {
+            ::puts stdout "session $name: ok ([llength $messages] messages, [file size $path] bytes)"
+        }
+    }
+
+    set current {}
+    if {[dict exists $config current_session]} {
+        set current [dict get $config current_session]
+    }
+    if {$current ne {} && ![session_exists $current]} {
+        ::puts stderr "current session: $current has no file"
+        incr problems
+    }
+
+    return $problems
+}
+
+
+proc ::featherweight::script_session {options} {
+    if {[llength $options] == 0} {
+        usage_error {session needs list, show, or check}
+    }
+    set sub [lindex $options 0]
+    set options [lrange $options 1 end]
+
+    switch -- $sub {
+        list {
+            set damage [load_state_for_inspection]
+            session_list
+            if {$damage ne {}} { return 1 }
+            return 0
+        }
+        show {
+            if {[llength $options] == 0} {
+                usage_error {session show needs a name}
+            }
+            set name [lindex $options 0]
+            set options [lrange $options 1 end]
+            set last 0
+            while {[llength $options]} {
+                set option [lindex $options 0]
+                set options [lrange $options 1 end]
+                switch -- $option {
+                    --last {
+                        if {[llength $options] == 0} { usage_error {--last needs a number} }
+                        set last [lindex $options 0]
+                        set options [lrange $options 1 end]
+                        if {![string is integer -strict $last] || $last < 1} {
+                            usage_error {--last needs a positive number}
+                        }
+                    }
+                    default { usage_error "unknown option: $option" }
+                }
+            }
+            session_show $name $last
+            return 0
+        }
+        check {
+            set damage [load_state_for_inspection]
+            set problems 0
+            if {$damage ne {}} { incr problems }
+            incr problems [session_check]
+            if {$problems} { return 1 }
+            return 0
+        }
+        default {
+            usage_error "unknown session subcommand: $sub"
+        }
+    }
+}
+
+
+# Evaluate Tcl in the harness namespace, the way /eval and the run_code tool
+# do, with the output on stdout instead of in the debug log.
+proc ::featherweight::script_eval {options} {
+    variable run_code_output
+
+    if {[llength $options] == 0} {
+        usage_error {eval needs Tcl code}
+    }
+    set code [join $options { }]
+
+    set run_code_output {}
+    if {[catch {namespace eval ::featherweight $code} value detail]} {
+        ::puts stderr [dict get $detail -errorinfo]
+        exit 1
+    }
+    if {$run_code_output ne {} && ![string match *\n $run_code_output]} {
+        append run_code_output \n
+    }
+    ::puts -nonewline stdout $run_code_output
+    ::puts stdout $value
+    return 0
+}
+
+
+# Run every script in tests/, each in its own tclsh so a failure cannot take
+# this process down with it.
+proc ::featherweight::script_selftest {options} {
+    if {[llength $options]} {
+        usage_error {selftest takes no options}
+    }
+
+    set directory [file join [file dirname [file normalize [info script]]] tests]
+    if {![file isdirectory $directory]} {
+        error "no tests directory at $directory"
+    }
+    set tclsh [auto_execok tclsh]
+    if {$tclsh eq {}} {
+        error {tclsh is not on PATH}
+    }
+    set guard {}
+    if {[auto_execok timeout] ne {}} {
+        set guard [auto_execok timeout]
+    }
+
+    set total 0
+    set failed 0
+    foreach path [lsort [glob -nocomplain -directory $directory *.tcl]] {
+        if {[file tail $path] eq {lib.tcl}} { continue }
+        incr total
+
+        set cmdline [list {*}$tclsh $path]
+        if {$guard ne {}} { set cmdline [list {*}$guard 120 {*}$cmdline] }
+        lappend cmdline 2>@1
+        set pipe [open |$cmdline]
+        fconfigure $pipe -encoding utf-8
+        set output [read $pipe]
+        set code 0
+        if {[catch {close $pipe} error detail]} {
+            set errorcode [dict get $detail -errorcode]
+            if {[lindex $errorcode 0] eq {CHILDSTATUS}} {
+                set code [lindex $errorcode 2]
+            } else {
+                set code 1
+                append output "$errorcode: $error"
+            }
+        }
+
+        if {$code} {
+            incr failed
+            ::puts stdout "FAIL [file tail $path]"
+            ::puts stdout $output
+            continue
+        }
+        set checks {}
+        regexp {all ([0-9]+) checks passed} $output -> checks
+        if {$checks eq {}} { set checks {?} }
+        ::puts stdout "pass  [file tail $path] ($checks checks)"
+    }
+
+    if {$total == 0} {
+        error "no test scripts in $directory"
+    }
+    ::puts stdout {}
+    if {$failed} {
+        ::puts stdout "$failed of $total test scripts failed"
+        return 1
+    }
+    ::puts stdout "all $total test scripts passed"
+    return 0
 }
 
 
@@ -1638,12 +2240,17 @@ proc ::featherweight::main {argv0 argv} {
     variable json_tools
     variable tools_available
 
+    if {[llength $argv] > 0} {
+        script_main $argv
+        return
+    }
+
     init_config
 
     if {[catch {package require Tk} err]} {
-        ::puts "Tk/display unavailable ($err); falling back to console mode."
-        console_main
-        return
+        ::puts stderr "Tk/display unavailable ($err)."
+        ::puts stderr "For a headless run, use: [file tail $argv0] debug --help"
+        exit 1
     }
 
     set json_tools {}
@@ -1652,10 +2259,10 @@ proc ::featherweight::main {argv0 argv} {
     }
 
     if {[catch {build_ui} err]} {
-        ::puts "Could not create UI ($err); falling back to console mode."
+        ::puts stderr "Could not create UI ($err)."
         catch {destroy .}
-        console_main
-        return
+        ::puts stderr "For a headless run, use: [file tail $argv0] debug --help"
+        exit 1
     }
 
     replay_messages
