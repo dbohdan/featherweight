@@ -18,6 +18,8 @@ namespace eval ::featherweight {
         endpoint https://openrouter.ai/api/v1/chat/completions \
         model xiaomi/mimo-v2.6-flash \
         context_size 1048576 \
+        retries 5 \
+        timeout 300 \
         timestamp_format {%Y-%m-%d %H:%M:%S %z} \
         system_prompt {You are an expert software developer working with a user on their code.
 The user will ask for changes to the code, or ask questions about it.
@@ -205,6 +207,23 @@ proc ::featherweight::init_config {} {
     # before it existed.
     if {![dict exists $config timestamp_format]} {
         dict set config timestamp_format {%Y-%m-%d %H:%M:%S %z}
+    }
+
+    # How often to send a request again when the network or the server drops
+    # it, and how long one request may take.
+    if {![dict exists $config retries]} {
+        dict set config retries 5
+    }
+    set retries [dict get $config retries]
+    if {![string is integer -strict $retries] || $retries < 0} {
+        error {retries must be an integer of at least 0}
+    }
+    if {![dict exists $config timeout]} {
+        dict set config timeout 300
+    }
+    set timeout [dict get $config timeout]
+    if {![string is integer -strict $timeout] || $timeout < 1} {
+        error {timeout must be an integer of at least 1 second}
     }
 
     # The current session must name a session file; anything else starts over
@@ -992,6 +1011,8 @@ namespace eval ::featherweight {
     variable json_tools {}
     variable busy 0
     variable done 0
+    # How many times the current request has been sent again after a failure.
+    variable retry_count 0
     variable request_channels
     array set request_channels {}
 }
@@ -1235,9 +1256,11 @@ proc ::featherweight::stop {} {
     variable busy
     variable curl_data
     variable request_channels
+    variable retry_count
 
     if {!$busy} { return }
     set busy 0
+    set retry_count 0
     foreach ch [array names request_channels] {
         fileevent $ch readable {}
         unset -nocomplain curl_data($ch)
@@ -1269,6 +1292,7 @@ proc ::featherweight::submit_or_stop {} {
 proc ::featherweight::submit {} {
     variable W
     variable busy
+    variable retry_count
     if {$busy} { return }
     set entry [dict get $W entry]
     set text [string trim [$entry get 1.0 end-1c]]
@@ -1277,6 +1301,7 @@ proc ::featherweight::submit {} {
     if {[handle_slash_command $text]} { return }
     set message [append_message [dict create role user content $text]]
     ui_user $text [message_time $message]
+    set retry_count 0
     set_ui_busy 1
     request_async
 }
@@ -1421,6 +1446,62 @@ proc ::featherweight::handle_slash_command text {
 }
 
 
+# What went wrong with a curl run, from the trailing --write-out line if it is
+# there, or from the error close reported. That line holds the HTTP status,
+# curl's exit code and curl's own message, and it survives a run that failed --
+# so the reason is named rather than guessed.
+proc ::featherweight::curl_error {output close_error} {
+    set marker [string last "\n" $output]
+    if {$marker >= 0} {
+        set metadata [string range $output [expr {$marker + 1}] end]
+        set error_msg [lassign $metadata status exit_code]
+        if {[string is integer -strict $exit_code] && $exit_code != 0} {
+            return "curl ($exit_code): $error_msg"
+        }
+    }
+    return "curl request failed: $close_error"
+}
+
+
+# Send the same request again after a pause, or give up once the configured
+# number of retries is spent. Only failures where the request never got
+# through come here -- a curl that could not connect, timed out, or had its
+# connection dropped, or a server answering 429 or 5xx -- since those are the
+# ones another attempt can fix. The pause grows 1, 2, 4, 8, 16 seconds.
+proc ::featherweight::retry_request {why} {
+    variable busy
+    variable config
+    variable retry_count
+
+    incr retry_count
+    set retries 5
+    if {[dict exists $config retries]} {
+        set retries [dict get $config retries]
+    }
+    if {$retry_count > $retries} {
+        debug_log error "giving up after $retries retries: $why"
+        set retry_count 0
+        set_ui_busy 0
+        return
+    }
+
+    set delay [expr {1 << ($retry_count - 1)}]
+    if {$delay > 16} {
+        set delay 16
+    }
+    debug_log error "retry $retry_count of $retries in $delay s: $why"
+    after [expr {$delay * 1000}] [list [namespace current]::retry_pending]
+}
+
+
+# One scheduled retry. The turn may have been stopped while it waited.
+proc ::featherweight::retry_pending {} {
+    variable busy
+    if {!$busy} { return }
+    request_async
+}
+
+
 proc ::featherweight::request_async {} {
     variable busy
     variable config
@@ -1438,7 +1519,7 @@ proc ::featherweight::request_async {} {
     debug_log request [pretty $payload]
 
     if {[catch {
-        set ch [open |[list curl  --data-binary @- << $payload  --header "Authorization: Bearer [api_key]"  --header {Content-Type: application/json}  --request POST  --show-error  --silent  --write-out "\n%{http_code} %{exitcode} %{errormsg}"  [dict get $config endpoint]  ]]
+        set ch [open |[list curl  --data-binary @- << $payload  --header "Authorization: Bearer [api_key]"  --header {Content-Type: application/json}  --request POST  --show-error  --silent  --max-time [dict get $config timeout]  --write-out "\n%{http_code} %{exitcode} %{errormsg}"  [dict get $config endpoint]  ]]
     } error]} {
         debug_log error "could not start curl request: $error"
         set_ui_busy 0
@@ -1456,17 +1537,17 @@ proc ::featherweight::request_readable ch {
     variable busy
     variable curl_data
     variable request_channels
+    variable retry_count
 
     if {!$busy || ![info exists request_channels($ch)]} { return }
 
     # Accumulate available output. Wait for EOF before parsing the response.
     if {[catch {read $ch} chunk]} {
-        debug_log error "could not read curl response: $chunk"
         fileevent $ch readable {}
         unset -nocomplain curl_data($ch)
         unset request_channels($ch)
         catch {close $ch}
-        set_ui_busy 0
+        retry_request "could not read curl response: $chunk"
         return
     }
     append curl_data($ch) $chunk
@@ -1479,10 +1560,9 @@ proc ::featherweight::request_readable ch {
     unset curl_data($ch)
     unset request_channels($ch)
 
-    if {[catch {close $ch} error options]} {
+    if {[catch {close $ch} error]} {
         if {!$busy} { return }
-        debug_log error "curl request failed: $error"
-        set_ui_busy 0
+        retry_request [curl_error $output $error]
         return
     }
     if {!$busy} { return }
@@ -1511,16 +1591,22 @@ proc ::featherweight::request_readable ch {
     }
 
     if {$exit_code != 0} {
-        debug_log error "curl ($exit_code): $error_msg"
-        set_ui_busy 0
+        retry_request "curl ($exit_code): $error_msg"
         return
     }
+    set retry_count 0
 
     set data [string range $output 0 [expr {$marker - 1}]]
 
     debug_log response "HTTP $status\n[pretty $data]"
 
     if {$status != 200} {
+        # 429 and 5xx are the server asking for patience; anything else is
+        # the request being wrong and a retry would fail the same way.
+        if {$status == 429 || $status >= 500} {
+            retry_request "HTTP $status: $data"
+            return
+        }
         debug_log error "HTTP $status: $data"
         set_ui_busy 0
         return

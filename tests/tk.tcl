@@ -172,6 +172,32 @@ $chat configure -state disabled
 check "a message with no time is shown without a timestamp" \
     {[string trim [$chat get 1.0 end]] eq "You\nuntimed"}
 
+# A request the network drops is sent again, and gives up after the configured
+# number of retries. The endpoint is a dead port, so curl fails locally and
+# nothing leaves the machine.
+dict set ::featherweight::config endpoint http://127.0.0.1:1/
+dict set ::featherweight::config api_key_env_var TEST_API_KEY
+dict set ::featherweight::config retries 2
+dict set ::featherweight::config timeout 5
+set ::env(TEST_API_KEY) test-key
+set dbg [dict get $::featherweight::W debug]
+::featherweight::append_message [dict create role user content {hello}]
+set ::featherweight::retry_count 0
+set ::featherweight::busy 1
+::featherweight::request_async
+set deadline [expr {[clock milliseconds] + 30000}]
+while {$::featherweight::busy && [clock milliseconds] < $deadline} {
+    update
+    after 25
+}
+set log_text [$dbg get 1.0 end]
+check "a dropped request is retried before giving up" \
+    {[string first {retry 1 of 2} $log_text] >= 0
+        && [string first {retry 2 of 2} $log_text] >= 0
+        && [string first {giving up after 2 retries} $log_text] >= 0}
+check "the turn stops once the retries are spent" \
+    {$::featherweight::busy == 0}
+
 catch {destroy .}
 
 test::finish

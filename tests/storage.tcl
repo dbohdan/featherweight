@@ -279,6 +279,26 @@ ok "no legacy featherweight.conf was written" {
     expr {![file exists [file join $::test::work featherweight.conf]]}
 }
 
+puts "== retries and timeout =="
+set saved [slurp $config_path]
+dict set saved retries -1
+::fileutil::writeFile -encoding utf-8 $config_path $saved
+fails "a negative retry count is refused" {::featherweight::init_config}
+set saved [slurp $config_path]
+dict set saved retries 2
+dict set saved timeout 0
+::fileutil::writeFile -encoding utf-8 $config_path $saved
+fails "a zero timeout is refused" {::featherweight::init_config}
+set saved [slurp $config_path]
+dict set saved retries 5
+dict set saved timeout 300
+::fileutil::writeFile -encoding utf-8 $config_path $saved
+::featherweight::init_config
+ok "the defaults are 5 retries and a 300 second timeout" {
+    expr {[dict get $::featherweight::config retries] == 5
+        && [dict get $::featherweight::config timeout] == 300}
+}
+
 puts "== every procedure compiles =="
 set source [slurp $::test::harness]
 ok "the source is complete Tcl" {expr {[info complete $source]}}
