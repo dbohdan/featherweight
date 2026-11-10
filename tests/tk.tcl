@@ -40,6 +40,10 @@ if {[catch {::featherweight::build_ui} error]} {
 ::puts stdout "pass  build_ui"
 incr ::test::passed
 
+# Geometry is only real once Tk has laid the window out; build_ui no longer
+# takes an update of its own.
+update
+
 check "the title is set when the window is built" \
     {[wm title .] eq "Featherweight - [file tail [pwd]]/ - [dict get $::featherweight::config model]"}
 
@@ -63,15 +67,32 @@ check "the conversation replays from the session file" \
     {[string first {user 0} [$chat get 1.0 end]] >= 0}
 check "the input is the third pane of the same panedwindow" \
     {[llength [.root.pane panes]] == 3 && {.root.input} in [.root.pane panes]}
-check "the Send button fills the height of the input" \
-    {[dict get [pack info .root.input.send] -fill] in {y both}}
-set sash_gap [expr {[.root.pane sashpos 1]
-    - [winfo height .root.pane.chatf]
-    - [winfo height .root.pane.dbgf]}]
-check "the gap beside the button matches the sash height" \
-    {$sash_gap > 0 && [dict get [pack info .root.input.send] -padx] eq [list $sash_gap 0]}
-check "the window title names the directory and the model" \
-    {[wm title .] eq "Featherweight - [file tail [pwd]]/ - [dict get $::featherweight::config model]"}
+
+# A sash sits between the input and Send, as one sits between Conversation and
+# Debug. ttk::panedwindow exposes no sash option, so the handle is found
+# through identify at the sash position.
+set sash_pos [.root.input.p sashpos 0]
+check "there is a sash between the input and the Send button" \
+    {$sash_pos > 0
+        && $sash_pos < [winfo width .root.input.p]
+        && [.root.input.p identify $sash_pos 5] ne {}}
+check "the Send button spans the height of the input" \
+    {[winfo height .root.input.p.send] == [winfo height .root.input.p]}
+check "the Send button keeps its own width" \
+    {[winfo width .root.input.p.send] == [winfo reqwidth .root.input.p.send]}
+
+# Window resizes feed the input pane, not the button.
+set wide_entry [winfo width .root.input.p.e]
+set wide_button [winfo width .root.input.p.send]
+set wide_window [winfo width .]
+wm geometry . [expr {$wide_window + 300}]x[winfo height .]
+update
+check "resizing the window widens the input, not the button" \
+    {[winfo width .root.input.p.e] > $wide_entry
+        && [winfo width .root.input.p.send] == $wide_button}
+wm geometry . ${wide_window}x[winfo height .]
+update
+
 ::featherweight::handle_slash_command {/model title/model}
 check "/model refreshes the title" \
     {[wm title .] eq "Featherweight - [file tail [pwd]]/ - title/model"}

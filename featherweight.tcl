@@ -1675,28 +1675,21 @@ proc ::featherweight::build_ui {} {
     .root.pane add .root.pane.dbgf -weight 2
 
     # The input is the third pane of the same panedwindow as Conversation and
-    # Debug, so the sash above it sets its height. The padding keeps it clear
-    # of that sash, and the button fills the pane's height beside the text.
+    # Debug, so the sash above it sets its height; the padding keeps it clear
+    # of that sash. Inside it the text and the Send button are two panes of a
+    # horizontal panedwindow, so a sash sits between them just as one sits
+    # between Conversation and Debug. -weight 1 on the text makes it the pane
+    # that window resizes feed; the button stays at its requested width.
     ttk::frame .root.input -padding {0 6 0 0}
-    text .root.input.e -wrap word -height 4 -width 40 -undo 1
-    bind .root.input.e <Control-Return> {::featherweight::submit; break}
-    bind .root.input.e <Control-KP_Enter> {::featherweight::submit; break}
-    ttk::button .root.input.send -text "Send" -command ::featherweight::submit_or_stop
-    pack .root.input.e -side left -fill both -expand 1
+    ttk::panedwindow .root.input.p -orient horizontal
+    text .root.input.p.e -wrap word -height 4 -width 40 -undo 1
+    bind .root.input.p.e <Control-Return> {::featherweight::submit; break}
+    bind .root.input.p.e <Control-KP_Enter> {::featherweight::submit; break}
+    ttk::button .root.input.p.send -text "Send" -command ::featherweight::submit_or_stop
+    .root.input.p add .root.input.p.e -weight 1
+    .root.input.p add .root.input.p.send -weight 0
+    pack .root.input.p -fill both -expand 1
     .root.pane add .root.input -weight 1
-
-    # The gap between the input and the button is the height of the sash above
-    # them, so the vertical and horizontal spacing read as one measurement.
-    # The sash is only in the geometry once the window is mapped, hence the
-    # update; a window that cannot be measured falls back to 6.
-    update
-    set gap [expr {[.root.pane sashpos 1]
-        - [winfo height .root.pane.chatf]
-        - [winfo height .root.pane.dbgf]}]
-    if {$gap < 1} {
-        set gap 6
-    }
-    pack .root.input.send -side right -fill y -padx [list $gap 0]
 
     ttk::label .root.status -text "Ready" -anchor w
     pack .root.status -fill x
@@ -1704,8 +1697,8 @@ proc ::featherweight::build_ui {} {
     set W [dict create\
         chat .root.pane.chatf.body.t\
         debug .root.pane.dbgf.body.t\
-        entry .root.input.e\
-        send .root.input.send\
+        entry .root.input.p.e\
+        send .root.input.p.send\
         status .root.status]
 
     # update_window_title waits for the chat widget in W, so it can only run
