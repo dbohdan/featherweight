@@ -1,5 +1,5 @@
 #! /usr/bin/env tclsh
-# Tests for script mode: tclsh bootstrap.tcl debug <subcommand>.
+# Tests for script mode: tclsh featherweight.tcl debug <subcommand>.
 
 source [file join [file dirname [info script]] lib.tcl]
 test::start

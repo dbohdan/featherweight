@@ -8,7 +8,7 @@ namespace eval ::test {
     variable passed 0
     variable failed 0
     variable work {}
-    variable bootstrap {}
+    variable harness {}
 }
 
 # Create a clean working directory, cd into it, and load Featherweight into
@@ -18,13 +18,13 @@ proc ::test::start {{path {}}} {
     variable passed
     variable failed
     variable work
-    variable bootstrap
+    variable harness
 
     set here [file dirname [file normalize [info script]]]
     if {$path eq {}} {
-        set path [file normalize [file join $here .. bootstrap.tcl]]
+        set path [file normalize [file join $here .. featherweight.tcl]]
     }
-    set bootstrap $path
+    set harness $path
 
     set work [file join $here .tmp [file rootname [file tail [info script]]]]
     file delete -force $work
@@ -34,7 +34,7 @@ proc ::test::start {{path {}}} {
     set passed 0
     set failed 0
 
-    source $bootstrap
+    source $harness
 }
 
 # Report and set the exit status. Every test ends this way.
@@ -94,7 +94,7 @@ proc run_cli {argv} {
         error {tclsh is not on PATH}
     }
 
-    set pipe [open |[list {*}$tclsh $::test::bootstrap {*}$argv 2>@1]]
+    set pipe [open |[list {*}$tclsh $::test::harness {*}$argv 2>@1]]
     fconfigure $pipe -encoding utf-8
     set output [read $pipe]
     set code 0

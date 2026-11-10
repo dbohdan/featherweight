@@ -280,7 +280,7 @@ ok "no legacy featherweight.conf was written" {
 }
 
 puts "== every procedure compiles =="
-set source [slurp $::test::bootstrap]
+set source [slurp $::test::harness]
 ok "the source is complete Tcl" {expr {[info complete $source]}}
 set uncompiled {}
 foreach name [lsort [info procs ::featherweight::*]] {

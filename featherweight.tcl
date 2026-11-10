@@ -1720,8 +1720,8 @@ proc ::featherweight::build_ui {} {
 
 
 proc ::featherweight::usage {} {
-    return {Usage: tclsh bootstrap.tcl [debug <subcommand> [options]]
-       tclsh bootstrap.tcl --help
+    return {Usage: tclsh featherweight.tcl [debug <subcommand> [options]]
+       tclsh featherweight.tcl --help
 
 With no arguments, the Tk interface starts.
 
@@ -1779,7 +1779,7 @@ proc ::featherweight::message_summary {message} {
 }
 
 
-# Script mode: tclsh bootstrap.tcl debug <subcommand> ...
+# Script mode: tclsh featherweight.tcl debug <subcommand> ...
 proc ::featherweight::script_main {argv} {
     variable json_tools
     variable tools_available
