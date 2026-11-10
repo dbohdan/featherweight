@@ -218,6 +218,9 @@ foreach tag [$dbg tag names] {
 }
 check "a tool note stays visible" \
     {[llength $bodies] == $folded_count}
+check "the marker's underline matches its text colour" \
+    {[tag_value $dbg cat_request -underlinefg] eq [tag_value $dbg cat_request -foreground]
+        && [tag_value $dbg cat_tool -underlinefg] eq [tag_value $dbg cat_tool -foreground]}
 
 # A request the network drops is sent again, and gives up after the configured
 # number of retries. The endpoint is a dead port, so curl fails locally and

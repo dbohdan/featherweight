@@ -1860,10 +1860,13 @@ proc ::featherweight::build_ui {} {
     $chat configure -state disabled
 
     set dbg [dict get $W debug]
-    $dbg tag configure cat_error -foreground #ff6b6b
-    $dbg tag configure cat_request -foreground #4fc3f7
-    $dbg tag configure cat_response -foreground #a5d6a7
-    $dbg tag configure cat_tool -foreground #ce93d8
+    # -underlinefg is the colour of an underline, which Tk otherwise draws in
+    # its own default whatever the text is: a fold marker is underlined, so
+    # the underline is given the text's own colour to match it.
+    $dbg tag configure cat_error -foreground #ff6b6b -underlinefg #ff6b6b
+    $dbg tag configure cat_request -foreground #4fc3f7 -underlinefg #4fc3f7
+    $dbg tag configure cat_response -foreground #a5d6a7 -underlinefg #a5d6a7
+    $dbg tag configure cat_tool -foreground #ce93d8 -underlinefg #ce93d8
     # The [+] / [-] of a folded entry: underlined, since it is the only thing
     # in the log that responds to a click.
     $dbg tag configure dbg_toggle -underline 1
