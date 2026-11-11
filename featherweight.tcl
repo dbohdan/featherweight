@@ -1576,7 +1576,19 @@ proc ::featherweight::request_async {} {
     debug_log request [pretty $payload]
 
     if {[catch {
-        set ch [open |[list curl  --data-binary @- << $payload  --header "Authorization: Bearer [api_key]"  --header {Content-Type: application/json}  --request POST  --show-error  --silent  --max-time [dict get $config timeout]  --write-out "\n%{http_code} %{exitcode} %{errormsg}"  [dict get $config endpoint]  ]]
+        set ch [open |[list curl \
+            --data-binary @- << $payload \
+            --header "Authorization: Bearer [api_key]" \
+            --header {Content-Type: application/json} \
+            --header {X-OpenRouter-Title: Featherweight} \
+            --referer https://dbohdan.com/featherweight \
+            --request POST \
+            --show-error \
+            --silent \
+            --max-time [dict get $config timeout] \
+            --write-out "\n%{http_code} %{exitcode} %{errormsg}" \
+            [dict get $config endpoint] \
+        ]]
     } error]} {
         debug_log error "could not start curl request: $error"
         set_ui_busy 0
