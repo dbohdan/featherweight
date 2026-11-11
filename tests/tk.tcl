@@ -226,8 +226,46 @@ foreach tag [$dbg tag names] {
 }
 set last_toggle [lindex $toggles end]
 check "the marker's underline matches its text colour" \
-    {[tag_value $dbg cat_request -underlinefg] eq [tag_value $dbg cat_request -foreground]
-        && [tag_value $dbg cat_tool -underlinefg] eq [tag_value $dbg cat_tool -foreground]}
+    {[tag_value $dbg toggle$n -underline] == 1
+        && [tag_value $dbg toggle$n -underlinefg] eq [tag_value $dbg cat_request -foreground]
+        && [tag_value $dbg $last_toggle -underlinefg] eq [tag_value $dbg cat_tool -foreground]}
+
+# Attachments go out with the next user message, and are listed in the status
+# bar until they do.
+set png [file join $::test::work shot.png]
+::fileutil::writeFile -encoding binary $png "fake image bytes"
+::featherweight::handle_slash_command "/attach $png"
+check "attach lists the image in the status bar" \
+    {[llength $::featherweight::attachments] == 1
+        && [string first {(1) shot.png} [[dict get $::featherweight::W status] cget -text]] >= 0}
+check "attach keeps a copy in the state directory" \
+    {[file exists [file join [::featherweight::attachments_dir] 1-shot.png]]}
+set png2 [file join $::test::work other.png]
+::fileutil::writeFile -encoding binary $png2 "more fake bytes"
+::featherweight::handle_slash_command "/attach $png2"
+check "a second attachment is numbered" \
+    {[string first {(2) other.png} [[dict get $::featherweight::W status] cget -text]] >= 0}
+::featherweight::handle_slash_command {/detach 1}
+check "detach removes one by number and renumbers the list" \
+    {[llength $::featherweight::attachments] == 1
+        && [string first {(1) other.png} [[dict get $::featherweight::W status] cget -text]] >= 0
+        && ![file exists [file join [::featherweight::attachments_dir] 1-shot.png]]}
+set attached [dict create role user content [list \
+    [dict create type text text {look at this}] \
+    [dict create type image name other.png path [file join [::featherweight::attachments_dir] 2-other.png]]]]
+check "the request carries an attached image as a data URL" \
+    {[string first {image_url} [::featherweight::json_message $attached]] >= 0
+        && [string first {base64,} [::featherweight::json_message $attached]] >= 0}
+check "an attached image is counted from its shape, not its bytes" \
+    {[::featherweight::message_tokens $attached] == 1600 + [::featherweight::estimate_tokens {look at this}]}
+check "the report counts staged attachments too" \
+    {[string first {staged attachments} [::featherweight::context_report]] >= 0}
+check "a message with an image displays it by name" \
+    {[string first {[image: other.png]} [::featherweight::content_display [dict get $attached content]]] >= 0}
+::featherweight::handle_slash_command {/detach}
+check "detach with no argument clears them" \
+    {[llength $::featherweight::attachments] == 0
+        && [[dict get $::featherweight::W status] cget -text] eq {Ready}}
 
 # A request the network drops is sent again, and gives up after the configured
 # number of retries. The endpoint is a dead port, so curl fails locally and

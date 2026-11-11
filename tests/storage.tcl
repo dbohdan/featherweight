@@ -299,6 +299,45 @@ ok "the defaults are 5 retries and a 300 second timeout" {
         && [dict get $::featherweight::config timeout] == 300}
 }
 
+puts "== attached images =="
+# A PNG header with real dimensions is all the estimator reads.
+set png [file join $::test::work shot.png]
+::fileutil::writeFile -encoding binary $png [string cat "\x89PNG\r\n\x1a\n" \
+    [binary format I 13] IHDR [binary format II 888 655] {fake image bytes}]
+set parts [list \
+    [dict create type text text {look at this}] \
+    [dict create type image name shot.png path $png] \
+]
+set message [dict create role user content $parts time [clock seconds]]
+set json [::featherweight::json_message $message]
+ok "an image becomes a data URL in the request" {
+    expr {[string first {image_url} $json] >= 0
+        && [string first {base64,} $json] >= 0
+        && [string first {look at this} $json] >= 0}
+}
+ok "an image is estimated from its dimensions, not its bytes" {
+    expr {[::featherweight::image_tokens $png] == 765
+        && [::featherweight::message_tokens $message]
+            == 765 + [::featherweight::estimate_tokens {look at this}]}
+}
+ok "an image of unknown shape is counted on the high side" {
+    expr {[::featherweight::image_tokens [file join $::test::work nope.png]] == 1600}
+}
+ok "a very large image is capped where the provider downscales" {
+    set big [file join $::test::work big.png]
+    ::fileutil::writeFile -encoding binary $big [string cat "\x89PNG\r\n\x1a\n" \
+        [binary format I 13] IHDR [binary format II 8000 8000] {}]
+    expr {[::featherweight::image_tokens $big] == 2600}
+}
+ok "a message with parts round trips and shows its images" {
+    ::featherweight::set_current_messages [list $message]
+    set ::featherweight::sessions [dict create]
+    set reloaded [::featherweight::current_messages]
+    expr {[dict get [lindex $reloaded 0] content] eq $parts
+        && [string first {[image: shot.png]} \
+            [::featherweight::content_display [dict get [lindex $reloaded 0] content]]] >= 0}
+}
+
 puts "== every procedure compiles =="
 set source [slurp $::test::harness]
 ok "the source is complete Tcl" {expr {[info complete $source]}}

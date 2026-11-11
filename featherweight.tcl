@@ -300,9 +300,125 @@ proc ::featherweight::estimate_tokens {text} {
 proc ::featherweight::messages_tokens messages {
     set total 0
     foreach message $messages {
-        incr total [estimate_tokens [json_message $message]]
+        incr total [message_tokens $message]
     }
     return $total
+}
+
+
+# A message's share of the context budget. An image is estimated from its
+# dimensions, not counted as its bytes: see image_tokens.
+proc ::featherweight::message_tokens message {
+    if {[dict exists $message content] && [is_parts [dict get $message content]]} {
+        set total 0
+        foreach part [dict get $message content] {
+            if {[dict get $part type] eq {image}} {
+                incr total [image_tokens [dict get $part path]]
+            } else {
+                incr total [estimate_tokens [dict get $part text]]
+            }
+        }
+        return $total
+    }
+    return [estimate_tokens [json_message $message]]
+}
+
+
+# What one image adds to a request.
+#
+# There is no counting an image the way there is counting text: the number is
+# the provider's, computed from dimensions by a formula each one documents
+# differently, so this is declared rather than measured. OpenAI bills a base
+# plus one charge per 512-pixel tile, which is what an OpenRouter request
+# meets; Anthropic, for comparison, documents width x height / 750. Both are
+# approximations: a provider that resizes before counting will disagree.
+# Treat the number as the right order of magnitude, which is what a context
+# guard needs, and not as a bill.
+proc ::featherweight::image_tokens {path} {
+    set dimensions [image_dimensions $path]
+    if {[llength $dimensions] != 2} {
+        # Deliberately on the high side: a guard that under-counts lets a
+        # request through that the provider then refuses, which is the
+        # failure with a cost attached.
+        return 1600
+    }
+    lassign $dimensions width height
+
+    set wide [expr {($width + 511) / 512}]
+    set tall [expr {($height + 511) / 512}]
+    set tokens [expr {85 + 170 * $wide * $tall}]
+
+    # Providers downscale very large images before counting, so the formula
+    # runs away where they do not.
+    if {$tokens > 2600} {
+        set tokens 2600
+    }
+    return $tokens
+}
+
+
+# The width and height of an image file, read from its header. An empty list
+# means a format this does not parse, which leaves the estimate on its high
+# default.
+proc ::featherweight::image_dimensions {path} {
+    if {![file isfile $path]} {
+        return {}
+    }
+    set channel [open $path r]
+    fconfigure $channel -translation binary
+
+    # PNG: the dimensions are in the first chunk, big-endian.
+    set header [read $channel 24]
+    if {[string equal -length 8 $header "\x89PNG\r\n\x1a\n"]} {
+        close $channel
+        binary scan [string range $header 16 23] II width height
+        return [list $width $height]
+    }
+
+    # GIF: the logical screen descriptor, little-endian.
+    if {[string equal -length 3 $header "GIF"]} {
+        close $channel
+        binary scan [string range $header 6 9] ss width height
+        return [list $width $height]
+    }
+
+    # JPEG: walk the segments to a start-of-frame marker. The dimensions come
+    # after the precision byte, big-endian.
+    if {[string equal -length 2 $header "\xff\xd8"]} {
+        seek $channel 2 start
+        while {1} {
+            set byte [read $channel 1]
+            if {$byte eq {} || [scan $byte %c] != 0xFF} {
+                break
+            }
+            set marker [read $channel 1]
+            if {$marker eq {}} {
+                break
+            }
+            scan $marker %c code
+            if {$code == 0xD8 || $code == 0x01 || ($code >= 0xD0 && $code <= 0xD7)} {
+                continue
+            }
+            set length [read $channel 2]
+            if {[string length $length] < 2} {
+                break
+            }
+            binary scan $length S size
+            if {$code == 0xC0 || $code == 0xC1 || $code == 0xC2 || $code == 0xC3
+                    || $code == 0xC5 || $code == 0xC6 || $code == 0xC7
+                    || $code == 0xC9 || $code == 0xCA || $code == 0xCB
+                    || $code == 0xCD || $code == 0xCE || $code == 0xCF} {
+                set frame [read $channel 5]
+                close $channel
+                binary scan [string range $frame 1 4] SS height width
+                return [list $width $height]
+            }
+            seek $channel [expr {$size - 2}] current
+        }
+    }
+
+    close $channel
+    return {}
 }
 
 
@@ -331,8 +447,9 @@ proc ::featherweight::context_report {} {
     set size [dict get $config context_size]
     set history [messages_tokens [current_messages]]
     set tools [tools_tokens $json_tools]
-    set total [expr {$history + $tools}]
-    set report [format {Approximate request usage: %d tokens (%d history + %d tool schemas).} $total $history $tools]
+    set staged [attachments_tokens]
+    set total [expr {$history + $tools + $staged}]
+    set report [format {Approximate request usage: %d tokens (%d history + %d tool schemas + %d staged attachments).} $total $history $tools $staged]
     if {$size > 0} {
         append report [format "\nContext window: %d tokens; automatic compaction at %d history tokens." $size [history_budget]]
         append report [format "\nEstimated total usage: %.1f%% of the window." [expr {100.0 * $total / $size}]]
@@ -354,7 +471,7 @@ proc ::featherweight::harness_note {text} {
 
 proc ::featherweight::is_harness_note message {
     return [expr {[dict get $message role] eq {user}
-        && [string match {\[featherweight\]*} [dict get $message content]]}]
+        && [string match {\[featherweight\]*} [content_display [dict get $message content]]]}]
 }
 
 
@@ -362,7 +479,7 @@ proc ::featherweight::user_texts messages {
     set texts {}
     foreach message $messages {
         if {[dict get $message role] eq {user} && ![is_harness_note $message]} {
-            set text [string trim [dict get $message content]]
+            set text [string trim [content_display [dict get $message content]]]
             if {$text ne {}} {
                 lappend texts $text
             }
@@ -708,12 +825,91 @@ proc ::featherweight::json_message message {
         } elseif {$key eq {time}} {
             # Unix time is ours, kept for the record. It is not part of the
             # message the API expects, so it is neither sent nor counted.
+        } elseif {$key eq {content} && [is_parts $value]} {
+            lappend fields content [json_content $value]
         } else {
             lappend fields $key [::json::write string $value]
         }
     }
 
     return [::json::write object {*}$fields]
+}
+
+
+# Is this message content a list of parts -- words and images -- rather than
+# one string? The parts are dicts with a type.
+proc ::featherweight::is_parts value {
+    if {[catch {llength $value}] || [llength $value] == 0} {
+        return 0
+    }
+    set first [lindex $value 0]
+    if {[catch {dict exists $first type}]} {
+        return 0
+    }
+    return [dict exists $first type]
+}
+
+
+# A message's content as the API wants it: a string becomes one string, a list
+# of parts becomes a content array where each image carries its file as a data
+# URL.
+proc ::featherweight::json_content parts {
+    set out {}
+
+    foreach part $parts {
+        if {[dict get $part type] eq {image}} {
+            lappend out [::json::write object \
+                type [::json::write string image_url] \
+                image_url [::json::write object \
+                    url [::json::write string [image_data_url $part]]] \
+            ]
+        } else {
+            lappend out [::json::write object \
+                type [::json::write string text] \
+                text [::json::write string [dict get $part text]] \
+            ]
+        }
+    }
+    return [::json::write array {*}$out]
+}
+
+
+# An image part as a data URL, file read fresh so the message always shows
+# what is stored.
+proc ::featherweight::image_data_url part {
+    set channel [open [dict get $part path] r]
+    fconfigure $channel -translation binary
+    set data [read $channel]
+    close $channel
+    return "data:[image_mime [dict get $part name]];base64,[binary encode base64 $data]"
+}
+
+
+proc ::featherweight::image_mime name {
+    switch -- [string tolower [file extension $name]] {
+        .jpg - .jpeg { return image/jpeg }
+        .gif { return image/gif }
+        .webp { return image/webp }
+        default { return image/png }
+    }
+}
+
+
+# A message's content as one piece of text: the words, and a marker for each
+# image. Used for display, for the listings, and for what a fold quotes.
+proc ::featherweight::content_display content {
+    if {![is_parts $content]} {
+        return $content
+    }
+    set lines {}
+    foreach part $content {
+        if {[dict get $part type] eq {image}} {
+            lappend lines "\[image: [dict get $part name]\]"
+        } else {
+            lappend lines [dict get $part text]
+        }
+    }
+    return [join $lines \n]
 }
 
 
@@ -1011,8 +1207,10 @@ namespace eval ::featherweight {
     variable json_tools {}
     variable busy 0
     variable done 0
+
     # How many times the current request has been sent again after a failure.
     variable retry_count 0
+
     # The colour of each debug category. A fold marker's underline is drawn
     # in the colour of the tag that sets it, so the marker's own tag carries
     # both the underline and its colour -- set the colour anywhere else and
@@ -1023,9 +1221,14 @@ namespace eval ::featherweight {
         response #a5d6a7 \
         tool #ce93d8 \
     ]
-    # Collapsible debug entries: their number, and which of them are open.
+
+# Collapsible debug entries: their number, and which of them are open.
     variable debug_entry 0
     array set debug_open {}
+
+    # Images waiting to go out with the next user message: name and stored path.
+    variable attachments {}
+    variable attachment_number 0
     variable request_channels
     array set request_channels {}
 }
@@ -1293,7 +1496,7 @@ proc ::featherweight::replay_messages {} {
         set time [message_time $message]
         switch -- [dict get $message role] {
             user {
-                ui_user [dict get $message content] $time
+                ui_user [content_display [dict get $message content]] $time
             }
             assistant {
                 if {[dict exists $message content]} {
@@ -1322,6 +1525,112 @@ proc ::featherweight::replay_messages {} {
 }
 
 
+# What the images staged by /attach would add to the next request. They are
+# not in any message until that message is sent, so a count that walks the
+# conversation misses them -- and the moment the number is wanted is exactly
+# while they are staged and still being decided on.
+proc ::featherweight::attachments_tokens {} {
+    variable attachments
+
+    set total 0
+    foreach attachment $attachments {
+        incr total [image_tokens [dict get $attachment path]]
+    }
+    return $total
+}
+
+
+# Where a copy of each attached image is kept, so the record survives the
+# original being moved or deleted.
+proc ::featherweight::attachments_dir {} {
+    return [file join [state_dir] attachments]
+}
+
+
+# Attach an image to the next user message. With no path the file dialog
+# chooses one. The file is copied into the state directory.
+proc ::featherweight::attach_image {{path {}}} {
+    variable attachments
+    variable attachment_number
+
+    if {$path eq {}} {
+        set path [tk_getOpenFile -title {Attach an image} \
+            -filetypes {{{Images} {.png .jpg .jpeg .gif .webp}} {{All files} *}}]
+        if {$path eq {}} {
+            return {}
+        }
+    }
+    set path [file normalize $path]
+    if {![file isfile $path]} {
+        error "[list $path] is not a file"
+    }
+
+    set dir [attachments_dir]
+    file mkdir $dir
+    incr attachment_number
+    set name [file tail $path]
+    set stored [file join $dir "$attachment_number-$name"]
+    file copy -force $path $stored
+
+    lappend attachments [dict create name $name path $stored]
+    update_status_bar
+    return [lindex $attachments end]
+}
+
+
+# Detach one attachment by number, or every one of them with no argument.
+# Detaching removes the stored copy with it.
+proc ::featherweight::detach_attachments {{which {}}} {
+    variable attachments
+
+    if {$which eq {}} {
+        set count [llength $attachments]
+        foreach attachment $attachments {
+            catch {file delete -force [dict get $attachment path]}
+        }
+        set attachments {}
+        update_status_bar
+        return $count
+    }
+    if {![string is integer -strict $which]
+            || $which < 1 || $which > [llength $attachments]} {
+        error "[list $which] is not the number of an attachment"
+    }
+    set index [expr {$which - 1}]
+    catch {file delete -force [dict get [lindex $attachments $index] path]}
+    set attachments [lreplace $attachments $index $index]
+    update_status_bar
+    return 1
+}
+
+
+# The status bar's text: the state, then any attachments waiting to go out
+# with the next message -- Ready (1) screenshot.png (2) IMG_20261111.JPG
+proc ::featherweight::status_text {text} {
+    variable attachments
+
+    set n 0
+    foreach attachment $attachments {
+        incr n
+        append text " ($n) [dict get $attachment name]"
+    }
+    return $text
+}
+
+
+proc ::featherweight::update_status_bar {} {
+    variable W
+    variable busy
+
+    if {![dict exists $W status]} { return }
+    if {$busy} {
+        [dict get $W status] configure -text [status_text {Working...}]
+    } else {
+        [dict get $W status] configure -text [status_text Ready]
+    }
+}
+
+
 proc ::featherweight::set_ui_busy {flag} {
     variable W
     variable busy
@@ -1329,10 +1638,10 @@ proc ::featherweight::set_ui_busy {flag} {
     if {![dict exists $W send]} { return }
     if {$flag} {
         [dict get $W send] configure -text "Stop" -state normal
-        [dict get $W status] configure -text "Working..."
+        [dict get $W status] configure -text [status_text {Working...}]
     } else {
         [dict get $W send] configure -text "Send" -state normal
-        [dict get $W status] configure -text "Ready"
+        [dict get $W status] configure -text [status_text Ready]
         focus [dict get $W entry]
     }
 }
@@ -1379,14 +1688,31 @@ proc ::featherweight::submit {} {
     variable W
     variable busy
     variable retry_count
+    variable attachments
     if {$busy} { return }
     set entry [dict get $W entry]
     set text [string trim [$entry get 1.0 end-1c]]
     if {$text eq {}} { return }
     $entry delete 1.0 end
     if {[handle_slash_command $text]} { return }
-    set message [append_message [dict create role user content $text]]
-    ui_user $text [message_time $message]
+
+    # Any attachments go out with this message, and are done with.
+    set message [dict create role user]
+    if {[llength $attachments]} {
+        set content [list [dict create type text text $text]]
+        foreach attachment $attachments {
+            lappend content [dict create type image \
+                name [dict get $attachment name] \
+                path [dict get $attachment path]]
+        }
+        dict set message content $content
+        set attachments {}
+        update_status_bar
+    } else {
+        dict set message content $text
+    }
+    set message [append_message $message]
+    ui_user [content_display [dict get $message content]] [message_time $message]
     set retry_count 0
     set_ui_busy 1
     request_async
@@ -1519,6 +1845,32 @@ proc ::featherweight::handle_slash_command text {
                 return 1
             }
             debug_log tool "switched to session $name"
+        }
+        attach {
+            set path [string trim $arguments]
+            if {[catch {attach_image $path} attachment]} {
+                debug_log error "could not attach: $attachment"
+                return 1
+            }
+            if {$attachment ne {}} {
+                debug_log tool "attached [dict get $attachment name]"
+            }
+        }
+        detach {
+            set which [string trim $arguments]
+            if {$which ne {} && ![string is integer -strict $which]} {
+                debug_log error {usage: /detach ?number?}
+                return 1
+            }
+            if {[catch {detach_attachments $which} count]} {
+                debug_log error "could not detach: $count"
+                return 1
+            }
+            set plural {s}
+            if {$count == 1} {
+                set plural {}
+            }
+            debug_log tool "detached $count attachment$plural"
         }
         default {
             debug_log error "unknown command: /$command"
@@ -1958,7 +2310,7 @@ proc ::featherweight::usage_error {message} {
 # One line describing a message, for the listings.
 proc ::featherweight::message_summary {message} {
     if {[dict exists $message content] && [dict get $message content] ne {}} {
-        set text [string map [list "\n" " "] [dict get $message content]]
+        set text [string map [list "\n" " "] [content_display [dict get $message content]]]
         if {[string length $text] > 120} {
             set text "[string range $text 0 119]..."
         }
@@ -2318,7 +2670,7 @@ proc ::featherweight::session_show {name last} {
         ::puts stdout {}
         ::puts stdout $header
         if {[dict exists $message content]} {
-            ::puts stdout [dict get $message content]
+            ::puts stdout [content_display [dict get $message content]]
         }
         if {[dict exists $message tool_calls]} {
             foreach call [dict get $message tool_calls] {
