@@ -218,6 +218,13 @@ foreach tag [$dbg tag names] {
 }
 check "a tool note stays visible" \
     {[llength $bodies] == $folded_count}
+# Tk draws an underline in the colour of the tag that sets it, so the marker's
+# own tag carries both.
+set toggles {}
+foreach tag [$dbg tag names] {
+    if {[string match toggle* $tag]} { lappend toggles $tag }
+}
+set last_toggle [lindex $toggles end]
 check "the marker's underline matches its text colour" \
     {[tag_value $dbg cat_request -underlinefg] eq [tag_value $dbg cat_request -foreground]
         && [tag_value $dbg cat_tool -underlinefg] eq [tag_value $dbg cat_tool -foreground]}

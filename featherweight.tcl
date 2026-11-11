@@ -1013,6 +1013,16 @@ namespace eval ::featherweight {
     variable done 0
     # How many times the current request has been sent again after a failure.
     variable retry_count 0
+    # The colour of each debug category. A fold marker's underline is drawn
+    # in the colour of the tag that sets it, so the marker's own tag carries
+    # both the underline and its colour -- set the colour anywhere else and
+    # Tk draws the line in the widget's foreground instead.
+    variable debug_colors [dict create \
+        error #ff6b6b \
+        request #4fc3f7 \
+        response #a5d6a7 \
+        tool #ce93d8 \
+    ]
     # Collapsible debug entries: their number, and which of them are open.
     variable debug_entry 0
     array set debug_open {}
@@ -1055,10 +1065,18 @@ proc ::featherweight::debug_log {category text {label {}}} {
                 append head " $label"
             }
             $w insert end "$head " [list cat_$category]
-            $w insert end {[+]} [list cat_$category dbg_toggle toggle$n]
+            $w insert end {[+]} [list cat_$category toggle$n]
             $w insert end "\n" [list cat_$category]
             $w insert end "$text\n" [list cat_$category body$n]
             $w tag configure body$n -elide 1
+            # Tk draws an underline in the colour of the tag that sets it, so
+            # the marker's own tag carries the underline and its colour.
+            set color [debug_color $category]
+            if {$color eq {}} {
+                $w tag configure toggle$n -underline 1
+            } else {
+                $w tag configure toggle$n -underline 1 -underlinefg $color
+            }
             $w tag bind toggle$n <Button-1> [list [namespace current]::debug_toggle $w $n]
         } else {
             $w insert end "$ts ($category) $text\n" [list "cat_$category"]
@@ -1072,6 +1090,17 @@ proc ::featherweight::debug_log {category text {label {}}} {
         ::puts $fh "$ts ($category) $text"
         close $fh
     }]} {}
+}
+
+
+# The colour of one debug category, or {} for one that has none.
+proc ::featherweight::debug_color {category} {
+    variable debug_colors
+
+    if {[dict exists $debug_colors $category]} {
+        return [dict get $debug_colors $category]
+    }
+    return {}
 }
 
 
@@ -1872,16 +1901,10 @@ proc ::featherweight::build_ui {} {
     $chat configure -state disabled
 
     set dbg [dict get $W debug]
-    # -underlinefg is the colour of an underline, which Tk otherwise draws in
-    # its own default whatever the text is: a fold marker is underlined, so
-    # the underline is given the text's own colour to match it.
-    $dbg tag configure cat_error -foreground #ff6b6b -underlinefg #ff6b6b
-    $dbg tag configure cat_request -foreground #4fc3f7 -underlinefg #4fc3f7
-    $dbg tag configure cat_response -foreground #a5d6a7 -underlinefg #a5d6a7
-    $dbg tag configure cat_tool -foreground #ce93d8 -underlinefg #ce93d8
-    # The [+] / [-] of a folded entry: underlined, since it is the only thing
-    # in the log that responds to a click.
-    $dbg tag configure dbg_toggle -underline 1
+    variable debug_colors
+    dict for {category color} $debug_colors {
+        $dbg tag configure cat_$category -foreground $color
+    }
 
     install_text_context_menu [dict get $W chat]
     install_text_context_menu [dict get $W debug]
