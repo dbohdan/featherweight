@@ -989,7 +989,10 @@ proc ::featherweight::tool_run_code arguments {
     variable run_code_output
 
     if {[dict get $config debug]} {
-        debug_log tool "run_code $arguments"
+        # Folded, with the tool's name in its header, the way a call is: the
+        # code it runs is often many lines and otherwise drowns the log
+        # around it. The text keeps the name in it for the log file.
+        debug_log tool "run_code $arguments" run_code
     }
 
     set run_code_output {}

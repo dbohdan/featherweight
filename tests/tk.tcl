@@ -210,6 +210,17 @@ set body [lindex $bodies end]
 check "a tool call is folded with its name in the header" \
     {[string first {(tool) run_code [+]} [$dbg get 1.0 end]] >= 0
         && [tag_value $dbg $body -elide]}
+# The execution is logged as well as the call, and folds the same way.
+::featherweight::tool_run_code [dict create code {return ok}]
+set bodies {}
+foreach tag [$dbg tag names] {
+    if {[string match body* $tag]} { lappend bodies $tag }
+}
+set body [lindex $bodies end]
+check "a tool execution is folded like the call" \
+    {[string first {(tool) run_code [+]} [$dbg get 1.0 end]] >= 0
+        && [tag_value $dbg $body -elide]
+        && [string first {run_code code} [$dbg get 1.0 end]] >= 0}
 set folded_count [llength $bodies]
 ::featherweight::debug_log tool {model set to test/model}
 set bodies {}
