@@ -5,6 +5,7 @@ package require Tcl 8.6 9
 package require fileutil
 package require json
 package require json::write
+package require sha256
 
 
 namespace eval ::featherweight {
@@ -858,11 +859,23 @@ proc ::featherweight::json_content parts {
 
     foreach part $parts {
         if {[dict get $part type] eq {image}} {
-            lappend out [::json::write object \
-                type [::json::write string image_url] \
-                image_url [::json::write object \
-                    url [::json::write string [image_data_url $part]]] \
-            ]
+            set url [image_data_url $part]
+            if {$url eq {}} {
+                # The file is gone -- moved on disk, or deleted by a detach
+                # before those stopped deleting. Say so rather than fail the
+                # request: the words around it still go out.
+                debug_log error "attachment is missing: [dict get $part name]"
+                lappend out [::json::write object \
+                    type [::json::write string text] \
+                    text [::json::write string "\[image unavailable: [dict get $part name]\]"] \
+                ]
+            } else {
+                lappend out [::json::write object \
+                    type [::json::write string image_url] \
+                    image_url [::json::write object \
+                        url [::json::write string $url]] \
+                ]
+            }
         } else {
             lappend out [::json::write object \
                 type [::json::write string text] \
@@ -874,13 +887,23 @@ proc ::featherweight::json_content parts {
 }
 
 
-# An image part as a data URL, file read fresh so the message always shows
-# what is stored.
+# An image part as a data URL. An empty string means the file could not be
+# read, which the caller has to be ready for: a missing attachment is a
+# reason to say so, never a reason to fail the request or leave the interface
+# waiting on it.
 proc ::featherweight::image_data_url part {
-    set channel [open [dict get $part path] r]
-    fconfigure $channel -translation binary
-    set data [read $channel]
-    close $channel
+    set channel {}
+    if {[catch {
+        set channel [open [dict get $part path] r]
+        fconfigure $channel -translation binary
+        set data [read $channel]
+        close $channel
+    }]} {
+        if {$channel ne {}} {
+            catch {close $channel}
+        }
+        return {}
+    }
     return "data:[image_mime [dict get $part name]];base64,[binary encode base64 $data]"
 }
 
@@ -1228,7 +1251,6 @@ namespace eval ::featherweight {
 
     # Images waiting to go out with the next user message: name and stored path.
     variable attachments {}
-    variable attachment_number 0
     variable request_channels
     array set request_channels {}
 }
@@ -1540,6 +1562,12 @@ proc ::featherweight::attachments_tokens {} {
 }
 
 
+# What a file contains, in hex, which is what its stored copy is named after.
+proc ::featherweight::attachment_digest {path} {
+    return [::sha2::sha256 -hex -filename $path]
+}
+
+
 # Where a copy of each attached image is kept, so the record survives the
 # original being moved or deleted.
 proc ::featherweight::attachments_dir {} {
@@ -1551,7 +1579,6 @@ proc ::featherweight::attachments_dir {} {
 # chooses one. The file is copied into the state directory.
 proc ::featherweight::attach_image {{path {}}} {
     variable attachments
-    variable attachment_number
 
     if {$path eq {}} {
         set path [tk_getOpenFile -title {Attach an image} \
@@ -1567,10 +1594,13 @@ proc ::featherweight::attach_image {{path {}}} {
 
     set dir [attachments_dir]
     file mkdir $dir
-    incr attachment_number
     set name [file tail $path]
-    set stored [file join $dir "$attachment_number-$name"]
-    file copy -force $path $stored
+    # The blob is named by what it contains, so one picture is stored once
+    # however often it is attached, and one name never means two things.
+    set stored [file join $dir [attachment_digest $path]]
+    if {![file exists $stored]} {
+        file copy -force $path $stored
+    }
 
     lappend attachments [dict create name $name path $stored]
     update_status_bar
@@ -1579,15 +1609,15 @@ proc ::featherweight::attach_image {{path {}}} {
 
 
 # Detach one attachment by number, or every one of them with no argument.
-# Detaching removes the stored copy with it.
+# The stored copy stays: blobs are content-addressed and shared between
+# messages, so one that a message has already been sent with is still part of
+# the record. Deleting them here is what left a sent message pointing at
+# nothing and every later request failing.
 proc ::featherweight::detach_attachments {{which {}}} {
     variable attachments
 
     if {$which eq {}} {
         set count [llength $attachments]
-        foreach attachment $attachments {
-            catch {file delete -force [dict get $attachment path]}
-        }
         set attachments {}
         update_status_bar
         return $count
@@ -1596,9 +1626,7 @@ proc ::featherweight::detach_attachments {{which {}}} {
             || $which < 1 || $which > [llength $attachments]} {
         error "[list $which] is not the number of an attachment"
     }
-    set index [expr {$which - 1}]
-    catch {file delete -force [dict get [lindex $attachments $index] path]}
-    set attachments [lreplace $attachments $index $index]
+    set attachments [lreplace $attachments [expr {$which - 1}] [expr {$which - 1}]]
     update_status_bar
     return 1
 }
@@ -1948,12 +1976,17 @@ proc ::featherweight::request_async {} {
     variable request_channels
 
     if {!$busy} { return }
-    if {[catch {prepare_request} messages]} {
-        debug_log error $messages
+    # Everything that builds the request is inside this catch. An error that
+    # escaped it is what left the interface saying "Working..." forever, with
+    # Tk's dialog up behind it and nothing in the log but the traceback.
+    if {[catch {
+        set messages [prepare_request]
+        set payload [json_payload [dict get $config model] $json_tools $messages]
+    } error]} {
+        debug_log error $error
         set_ui_busy 0
         return
     }
-    set payload [json_payload [dict get $config model] $json_tools $messages]
     debug_log request [pretty $payload]
 
     if {[catch {
