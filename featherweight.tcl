@@ -2836,7 +2836,7 @@ proc ::featherweight::ui_tool_code {call {time {}}} {
                 && [dict exists $decoded code]} {
             set arguments [dict get $decoded code]
         }
-        ui_label "Tool code" $time
+        ui_label "Tool call: run_code" $time
         ui_append tool "$arguments\n\n"
         return
     }
@@ -2846,7 +2846,7 @@ proc ::featherweight::ui_tool_code {call {time {}}} {
 
 
 proc ::featherweight::ui_tool {text {time {}}} {
-    ui_label "Tool result" $time
+    ui_label "Result" $time
     ui_append tool "$text\n\n"
 }
 

@@ -62,8 +62,8 @@ ok "the call names the tool" {
 ::featherweight::ui_tool {the result} {}
 set text [$chat get 1.0 end]
 ok "the result is labelled as one" {
-    expr {[string first {Tool result} $text] >= 0
-        && [string first {Tool code} $text] < 0}
+    expr {[string first {Result} $text] >= 0
+        && [string first {Tool result} $text] < 0}
 }
 
 puts "== the gap between the label and the date =="
@@ -78,7 +78,7 @@ puts "== run_code still shows its code =="
 ::featherweight::ui_tool_code [call run_code {{"code": "puts hi"}}] {}
 set text [$chat get 1.0 end]
 ok "the code, and the old label" {
-    expr {[string first {Tool code} $text] >= 0
+    expr {[string first {Tool call: run_code} $text] >= 0
         && [string first {puts hi} $text] >= 0}
 }
 
