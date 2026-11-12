@@ -64,6 +64,21 @@ ok "the time is ours and is not part of the message sent to the API" {
         && [string first {"content"} $json] >= 0}
 }
 
+puts "== memoized serialization =="
+set message [lindex [::featherweight::load_session default] 1]
+set fresh [::featherweight::json_message_uncached $message]
+set key json,$message
+set ::featherweight::memo_values($key) poisoned
+ok "a second serialization is served from the cache" {
+    expr {[::featherweight::json_message $message] eq {poisoned}}
+}
+unset ::featherweight::memo_values($key)
+ok "and the cache holds exactly what the serializer computes" {
+    expr {[::featherweight::json_message $message] eq $fresh
+        && [::featherweight::message_tokens $message]
+            == [::featherweight::message_tokens_uncached $message]}
+}
+
 puts "== awkward contents round trip =="
 set nasty "line one\nline two {braces} \[brackets\] \\backslash \"quotes\" \${dollar}\n\ttab and ünïcode ✓"
 ::featherweight::append_message [dict create \

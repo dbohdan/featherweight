@@ -376,8 +376,23 @@ proc ::featherweight::load_session {name} {
 
     if {![dict exists $sessions $name]} {
         dict set sessions $name [read_session $name]
+        # Warm the serialization cache while the interface is idle, so the
+        # first request of a session is not the one that pays for it: on the
+        # 790-message conversation that first serialization is 85ms. See
+        # memo.
+        set messages [dict get $sessions $name]
+        after idle [list ::featherweight::memo_warm $messages]
     }
     return [dict get $sessions $name]
+}
+
+
+# Work out what every message serializes to and counts as, so the next call
+# finds it in the cache.
+proc ::featherweight::memo_warm messages {
+    foreach message $messages {
+        catch {message_tokens $message}
+    }
 }
 
 
@@ -482,6 +497,11 @@ proc ::featherweight::messages_tokens messages {
 # A message's share of the context budget. An image is estimated from its
 # dimensions, not counted as its bytes: see image_tokens.
 proc ::featherweight::message_tokens message {
+    return [memo tokens $message {message_tokens_uncached $message}]
+}
+
+
+proc ::featherweight::message_tokens_uncached message {
     if {[dict exists $message content] && [is_parts [dict get $message content]]} {
         set total 0
         foreach part [dict get $message content] {
@@ -494,6 +514,47 @@ proc ::featherweight::message_tokens message {
         return $total
     }
     return [estimate_tokens [json_message $message]]
+}
+
+
+# What a pure function of an immutable message returned, kept so the next
+# call does not work it out again. A request serializes the conversation
+# three times -- fold_plan and prepare_request each count tokens over it,
+# which serializes every message to measure it, and json_payload serializes
+# them all again to send -- and a message does not change once appended, so
+# only the first of those passes does any work. On the 750-message
+# conversation this takes those passes from about 200ms to one.
+#
+# The cache is bounded twice over, by entries and by bytes, and drops the
+# least recently used fifth in one pass when it grows past either bound.
+proc ::featherweight::memo {name key body} {
+    variable memo_bytes
+    variable memo_clock
+    variable memo_used
+    variable memo_values
+
+    set id $name,$key
+    if {[info exists memo_values($id)]} {
+        set memo_used($id) [incr memo_clock]
+        return $memo_values($id)
+    }
+    set value [uplevel 1 $body]
+    set memo_values($id) $value
+    set memo_used($id) [incr memo_clock]
+    incr memo_bytes [string length $value]
+    if {[array size memo_values] > 4000 || $memo_bytes > 32000000} {
+        set victims {}
+        foreach victim [array names memo_used] {
+            lappend victims [list $memo_used($victim) $victim]
+        }
+        set victims [lsort -integer -index 0 $victims]
+        foreach victim [lrange $victims 0 [expr {[llength $victims] / 5 - 1}]] {
+            set id [lindex $victim 1]
+            incr memo_bytes [expr {-[string length $memo_values($id)]}]
+            unset memo_values($id) memo_used($id)
+        }
+    }
+    return $value
 }
 
 
@@ -1015,6 +1076,11 @@ proc ::featherweight::json_tool_call call {
 }
 
 proc ::featherweight::json_message message {
+    return [memo json $message {json_message_uncached $message}]
+}
+
+
+proc ::featherweight::json_message_uncached message {
     set fields {}
 
     dict for {key value} $message {
@@ -2401,6 +2467,21 @@ namespace eval ::featherweight {
     array set run_code_payload {}
     variable run_code_expired
     array set run_code_expired {}
+
+    # What immutable messages serialize to and count as, kept so a request
+    # need not work it out three times over. See memo.
+    variable memo_values
+    array set memo_values {}
+    variable memo_used
+    array set memo_used {}
+    variable memo_clock 0
+    variable memo_bytes 0
+
+    # The debug entries whose body has not been built yet: a request or a
+    # tool result can be a megabyte and is folded shut anyway. See
+    # debug_toggle.
+    variable debug_text
+    array set debug_text {}
 }
 
 
@@ -2420,6 +2501,7 @@ proc ::featherweight::debug_log {category text {label {}}} {
     variable W
     variable debug_entry
     variable debug_open
+    variable debug_text
     if {![dict get $config debug] && $category ni {error}} { return }
     set ts [format_time [clock seconds]]
     if {[dict exists $W debug]} {
@@ -2430,9 +2512,17 @@ proc ::featherweight::debug_log {category text {label {}}} {
             # an HTML details element does. The label names the entry -- the
             # tool a call is for -- so the log stays navigable without
             # clicking. The marker opens it again.
+            #
+            # The body is not built here: a request or a tool result can be
+            # a megabyte, formatting it with jq costs real time, and the
+            # entry is folded shut anyway. What the entry holds is kept in
+            # debug_text, and debug_toggle builds it the first time the
+            # marker opens it. One empty line carries the body's tag so the
+            # entry has a body to open even before there is text to show.
             incr debug_entry
             set n $debug_entry
             set debug_open($n) 0
+            set debug_text($n) $text
             set head "$ts ($category)"
             if {$label ne {}} {
                 append head " $label"
@@ -2440,7 +2530,7 @@ proc ::featherweight::debug_log {category text {label {}}} {
             $w insert end "$head " [list cat_$category]
             $w insert end {[+]} [list cat_$category toggle$n]
             $w insert end "\n" [list cat_$category]
-            $w insert end "$text\n" [list cat_$category body$n]
+            $w insert end "\n" [list cat_$category body$n]
             $w tag configure body$n -elide 1
             # Tk draws an underline in the colour of the tag that sets it, so
             # the marker's own tag carries the underline and its colour.
@@ -2481,6 +2571,7 @@ proc ::featherweight::debug_color {category} {
 # either way, so nothing below it moves when it is clicked.
 proc ::featherweight::debug_toggle {w n} {
     variable debug_open
+    variable debug_text
 
     set open 0
     if {[info exists debug_open($n)]} {
@@ -2491,6 +2582,17 @@ proc ::featherweight::debug_toggle {w n} {
         $w tag configure body$n -elide 1
         set marker {[+]}
     } else {
+        if {[info exists debug_text($n)]} {
+            # The body was never built. It can be a megabyte and formatting
+            # it for display costs real time, so it is built the first time
+            # anyone asks for it: the entry's one empty line held its place.
+            set ranges [$w tag ranges body$n]
+            if {[llength $ranges] >= 2} {
+                lassign $ranges start end
+                $w insert $start [pretty $debug_text($n)] [$w tag names $start]
+            }
+            unset debug_text($n)
+        }
         $w tag configure body$n -elide 0
         set marker {[-]}
     }
@@ -3141,7 +3243,7 @@ proc ::featherweight::request_async {} {
         set_ui_busy 0
         return
     }
-    debug_log request [pretty $payload]
+    debug_log request $payload
 
     if {[catch {
         set ch [open |[list curl \
@@ -3235,7 +3337,7 @@ proc ::featherweight::request_readable ch {
 
     set data [string range $output 0 [expr {$marker - 1}]]
 
-    debug_log response "HTTP $status\n[pretty $data]"
+    debug_log response "HTTP $status\n$data"
 
     if {$status != 200} {
         # 429 and 5xx are the server asking for patience; anything else is

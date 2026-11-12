@@ -184,12 +184,13 @@ set body [lindex $bodies end]
 set n [string range $body 4 end]
 check "a request is logged folded to its header" \
     {[string first {(request) [+]} [$dbg get 1.0 end]] >= 0
-        && [string first {payload} [$dbg get 1.0 end]] >= 0
+        && [string first {payload} [$dbg get 1.0 end]] < 0
         && [tag_value $dbg $body -elide]}
 ::featherweight::debug_toggle $dbg $n
-check "the marker opens it" \
+check "the marker opens it and builds its body" \
     {![tag_value $dbg $body -elide]
-        && [string first {(request) [-]} [$dbg get 1.0 end]] >= 0}
+        && [string first {(request) [-]} [$dbg get 1.0 end]] >= 0
+        && [string first {payload} [$dbg get 1.0 end]] >= 0}
 ::featherweight::debug_toggle $dbg $n
 check "and closes it again" \
     {[tag_value $dbg $body -elide]
@@ -217,10 +218,15 @@ foreach tag [$dbg tag names] {
     if {[string match body* $tag]} { lappend bodies $tag }
 }
 set body [lindex $bodies end]
+set tool_n [string range $body 4 end]
 check "a tool execution is folded like the call" \
     {[string first {(tool) run_code [+]} [$dbg get 1.0 end]] >= 0
         && [tag_value $dbg $body -elide]
-        && [string first {run_code code} [$dbg get 1.0 end]] >= 0}
+        && [string first {run_code code} [$dbg get 1.0 end]] < 0}
+::featherweight::debug_toggle $dbg $tool_n
+check "and its body is built when it is opened" \
+    {[string first {run_code code} [$dbg get 1.0 end]] >= 0}
+::featherweight::debug_toggle $dbg $tool_n
 set folded_count [llength $bodies]
 ::featherweight::debug_log tool {model set to test/model}
 set bodies {}
