@@ -79,6 +79,26 @@ ok "the date leads, on its own line" {
         && ![string match "*You   $stamp*" $text]}
 }
 
+puts "== the model's reasoning is shown folded =="
+::featherweight::ui_thinking {first I think about it} 1700000000
+set body "body$::featherweight::thinking_serial"
+set text [$chat get 1.0 end]
+ok "the date leads, then a folded Thinking heading" {
+    expr {[string first "$stamp\nThinking \[+\]\n" $text] >= 0
+        && [string first {first I think about it} $text] >= 0
+        && [tag_value $chat $body -elide]}
+}
+::featherweight::ui_thinking_toggle $::featherweight::thinking_serial
+ok "the toggle opens it" {
+    expr {![tag_value $chat $body -elide]
+        && [string first {Thinking [-]} [$chat get 1.0 end]] >= 0}
+}
+::featherweight::ui_thinking_toggle $::featherweight::thinking_serial
+ok "and closes it again" {
+    expr {[tag_value $chat $body -elide]
+        && [string first {Thinking [+]} [$chat get 1.0 end]] >= 0}
+}
+
 puts "== run_code still shows its code =="
 ::featherweight::ui_tool_code [call run_code {{"code": "puts hi"}}] {}
 set text [$chat get 1.0 end]

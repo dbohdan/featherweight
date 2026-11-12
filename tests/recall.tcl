@@ -29,6 +29,12 @@ lappend messages [dict create role assistant content {} tool_calls [list \
         function [dict create name run_code arguments {{\"code\":\"puts hi\"}}]]]]
 lappend messages [dict create role tool tool_call_id call_1 \
     content {carbide output line}]
+# A message with reasoning, early enough that the fold drops it: the
+# reasoning is the model's own prose, which is what a search of the record
+# is most often for.
+lappend messages [dict create role assistant \
+    content {an answer about cadmium} \
+    reasoning {first I wondered about kryptonite}]
 for {set turn 2} {$turn < 6} {incr turn} {
     lappend messages [dict create role user \
         content "question $turn about zirconium [string repeat {filler } 150]"]
@@ -85,6 +91,13 @@ puts "== recall's own results are left out =="
 ok "a search cannot find a previous answer of its own" {
     expr {[string first {No matches outside this conversation} \
         [recall [dict create pattern zephyrous]]] >= 0}
+}
+
+puts "== the model's reasoning is in the record =="
+set out [recall [dict create pattern kryptonite]]
+ok "a search finds what the model reasoned, outside the conversation" {
+    expr {[string first {kryptonite} $out] >= 0
+        && [string first {outside this conversation} $out] >= 0}
 }
 
 puts "== the query is raw FTS5 =="

@@ -1092,9 +1092,11 @@ proc ::featherweight::json_message_uncached message {
             }
 
             lappend fields tool_calls [::json::write array {*}$calls]
-        } elseif {$key eq {time}} {
-            # Unix time is ours, kept for the record. It is not part of the
-            # message the API expects, so it is neither sent nor counted.
+        } elseif {$key eq {time} || $key eq {reasoning}} {
+            # Unix time and the model's reasoning are ours, kept for the
+            # record and the display. Neither is part of the message the API
+            # expects: the reasoning is never sent back, and neither is
+            # counted against the context budget.
         } elseif {$key eq {content} && [is_parts $value]} {
             lappend fields content [json_content $value]
         } else {
@@ -1910,6 +1912,11 @@ proc ::featherweight::recall_entries {name} {
 
         set text {}
         catch {set text [content_display [dict get $message content]]}
+        if {[dict exists $message reasoning]} {
+            # The reasoning is the model's own prose, which is what a search
+            # of the record is most often for.
+            append text \n [dict get $message reasoning]
+        }
         if {[dict exists $message tool_calls]} {
             foreach call [dict get $message tool_calls] {
                 catch {
@@ -2482,6 +2489,12 @@ namespace eval ::featherweight {
     # debug_toggle.
     variable debug_text
     array set debug_text {}
+
+    # The folded reasoning blocks in the conversation: their number, and
+    # which of them are open. See ui_thinking.
+    variable thinking_serial 0
+    variable thinking_open
+    array set thinking_open {}
 }
 
 
@@ -2620,6 +2633,15 @@ proc ::featherweight::clean_assistant_message {msg} {
     if {[dict exists $msg tool_calls]} {
         dict set out tool_calls [dict get $msg tool_calls]
     }
+    # The model's reasoning is kept for the record and shown folded, but it
+    # is never sent back: json_message leaves it out, the way it leaves out
+    # time. Providers name it either thing.
+    foreach key {reasoning reasoning_content} {
+        if {[dict exists $msg $key] && [dict get $msg $key] ni {"" null}} {
+            dict set out reasoning [dict get $msg $key]
+            break
+        }
+    }
     return $out
 }
 
@@ -2652,8 +2674,16 @@ proc ::featherweight::apply_message {cleaned} {
     variable busy
 
     set cleaned [append_message $cleaned]
+    set time [message_time $cleaned]
+    # The reasoning leads the message and carries its date; the blocks that
+    # follow are one message, so they take their labels without repeating it.
+    set thinking [message_reasoning $cleaned]
+    if {$thinking ne {}} {
+        ui_thinking $thinking $time
+        set time {}
+    }
     if {[dict exists $cleaned content]} {
-        ui_assistant [dict get $cleaned content] [message_time $cleaned]
+        ui_assistant [dict get $cleaned content] $time
     }
 
     if {![dict exists $cleaned tool_calls]} {
@@ -2664,7 +2694,7 @@ proc ::featherweight::apply_message {cleaned} {
         set name {}
         catch {set name [dict get $call function name]}
         debug_log tool "call: $call" $name
-        ui_tool_code $call [message_time $cleaned]
+        ui_tool_code $call $time
         set result [call_tool $call]
         if {!$busy} { return 0 }
         set result [append_message $result]
@@ -2702,12 +2732,22 @@ proc ::featherweight::message_time {message} {
 }
 
 
+# The model's own reasoning for a message, trimmed, or empty when it has
+# none. Kept for the record and shown folded; never sent back.
+proc ::featherweight::message_reasoning message {
+    if {![dict exists $message reasoning]} {
+        return {}
+    }
+    return [string trim [dict get $message reasoning]]
+}
+
+
 proc ::featherweight::ui_append {tag text} {
     variable W
     if {![dict exists $W chat]} { return }
     set t [dict get $W chat]
     $t configure -state normal
-    $t insert end $text [list $tag]
+    $t insert end $text $tag
     $t configure -state disabled
     $t see end
 }
@@ -2854,6 +2894,68 @@ proc ::featherweight::ui_tool {text {time {}}} {
 }
 
 
+# The model's own reasoning, shown folded: it is the work rather than the
+# answer, and the answer should not have to share the line with it. The
+# marker opens it the way the debug log's entries do. The date leads the
+# message here, so the blocks after it are one message and take their labels
+# without repeating it.
+proc ::featherweight::ui_thinking {text {time {}}} {
+    variable W
+    variable thinking_open
+    variable thinking_serial
+
+    incr thinking_serial
+    set n $thinking_serial
+    set thinking_open($n) 0
+    if {$time eq {}} {
+        ui_append role {Thinking }
+    } else {
+        ui_append timestamp "[format_time $time]\n"
+        ui_append role {Thinking }
+    }
+    ui_append [list role think$n] {[+]}
+    ui_append role "\n"
+    ui_append [list thinking body$n] "$text\n\n"
+
+    if {![dict exists $W chat]} { return }
+    set w [dict get $W chat]
+    $w tag configure body$n -elide 1
+    # The marker's own tag carries its colour as well as the underline: Tk
+    # draws an underline in the colour of the tag that sets it.
+    $w tag configure think$n -foreground #555555 -underline 1
+    $w tag bind think$n <Button-1> [list [namespace current]::ui_thinking_toggle $n]
+}
+
+
+# Open or close one folded reasoning block.
+proc ::featherweight::ui_thinking_toggle n {
+    variable W
+    variable thinking_open
+
+    if {![dict exists $W chat]} { return }
+    set w [dict get $W chat]
+    set open $thinking_open($n)
+    $w configure -state normal
+    if {$open} {
+        $w tag configure body$n -elide 1
+        set marker {[+]}
+    } else {
+        $w tag configure body$n -elide 0
+        set marker {[-]}
+    }
+    set ranges [$w tag ranges think$n]
+    if {[llength $ranges] >= 2} {
+        lassign $ranges start end
+        set tags [$w tag names $start]
+        $w delete $start $end
+        $w insert $start $marker $tags
+        $w see $start
+    }
+    set thinking_open($n) [expr {!$open}]
+    $w configure -state disabled
+}
+
+
 proc ::featherweight::replay_messages {} {
     variable config
 
@@ -2866,6 +2968,11 @@ proc ::featherweight::replay_messages {} {
                 ui_user [content_display [dict get $message content]] $time
             }
             assistant {
+                set thinking [message_reasoning $message]
+                if {$thinking ne {}} {
+                    ui_thinking $thinking $time
+                    set time {}
+                }
                 if {[dict exists $message content]} {
                     ui_assistant [dict get $message content] $time
                 }
@@ -3634,6 +3741,9 @@ proc ::featherweight::build_ui {} {
     $chat tag configure user -foreground #0b57d0
     $chat tag configure assistant -foreground #1b5e20
     $chat tag configure tool -foreground #6a1b9a
+    # The model's reasoning is its work rather than its answer: shown in a
+    # quieter colour, and folded shut to begin with.
+    $chat tag configure thinking -foreground #8a8a8a
     $chat configure -state disabled
 
     set dbg [dict get $W debug]

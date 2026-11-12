@@ -24,14 +24,6 @@ proc check {label condition} {
 # The current value of one option of a text tag. Tk 8.6 hands back a record of
 # five fields -- the option name, three empty ones, then the value -- so take
 # the value from wherever it turns up rather than assuming a shape.
-proc tag_value {chat tag option} {
-    set record [$chat tag configure $tag $option]
-    if {[llength $record] == 5 && [lindex $record 0] eq $option} {
-        return [lindex $record 4]
-    }
-    return $record
-}
-
 ::featherweight::init_config
 if {[catch {::featherweight::build_ui} error]} {
     ::puts stdout "FAIL build_ui: $error"

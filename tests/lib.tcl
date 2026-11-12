@@ -50,6 +50,17 @@ proc ::test::finish {} {
     exit 0
 }
 
+# Read one option of one text tag: what it is set to, not what it defaults
+# to. Tk answers with the option's whole record; the value is the last word
+# of it.
+proc tag_value {chat tag option} {
+    set record [$chat tag configure $tag $option]
+    if {[llength $record] == 5 && [lindex $record 0] eq $option} {
+        return [lindex $record 4]
+    }
+    return $record
+}
+
 # Read a file as UTF-8.
 proc slurp {path} {
     return [::fileutil::cat -encoding utf-8 $path]

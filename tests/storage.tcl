@@ -63,6 +63,21 @@ ok "the time is ours and is not part of the message sent to the API" {
     expr {[string first {"time"} $json] < 0
         && [string first {"content"} $json] >= 0}
 }
+ok "reasoning is kept for the record and never sent back" {
+    set message [dict create role assistant content {the answer} \
+        reasoning {first I think about it} time 1700000000]
+    set json [::featherweight::json_message $message]
+    expr {[string first {reasoning} $json] < 0
+        && [string first {the answer} $json] >= 0
+        && [::featherweight::message_reasoning $message] eq {first I think about it}}
+}
+::featherweight::append_message $message
+ok "and reasoning survives a fresh read from disk" {
+    set ::featherweight::sessions [dict create]
+    set messages [::featherweight::load_session [::featherweight::current_session_name]]
+    expr {[dict get [lindex $messages end] reasoning] eq {first I think about it}
+        && [dict get [lindex $messages end] content] eq {the answer}}
+}
 
 puts "== memoized serialization =="
 set message [lindex [::featherweight::load_session default] 1]
