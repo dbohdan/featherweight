@@ -2714,13 +2714,16 @@ proc ::featherweight::ui_append {tag text} {
 
 
 # The heading line of a message: the label in bold, with the message's time
-# beside it in a smaller font when it has one.
+# beside it in a smaller font when it has one. Three spaces between them: a
+# Tk text has no tab stops, so a tab would land wherever the font's space
+# width puts a multiple of eight, and a fixed separator is the only one that
+# looks the same at every label length.
 proc ::featherweight::ui_label {label time} {
     if {$time eq {}} {
         ui_append role "$label\n"
         return
     }
-    ui_append role "$label "
+    ui_append role "$label   "
     ui_append timestamp [format_time $time]
     ui_append role "\n"
 }
@@ -2738,23 +2741,112 @@ proc ::featherweight::ui_assistant {text {time {}}} {
 }
 
 
+# A tool call's arguments as lines for the conversation: one parameter per
+# line, in the tool's own order, the names padded so the values line up. The
+# padding is spaces -- a Tk text has no tab stops, so a tab would advance to
+# a multiple of the font's space and land anywhere -- and a value that runs
+# over one line goes on its own line beneath the name, not indented: a code
+# block or a path is read as it was written.
+proc ::featherweight::tool_arguments_text {name raw} {
+    set order {}
+    foreach key [lsort [dict keys $::featherweight::tools_available]] {
+        if {$key eq $name} {
+            set def [dict get $::featherweight::tools_available $key]
+            foreach {option value} $def {
+                if {$option eq {-param}} {
+                    lappend order [lindex $value 0]
+                }
+            }
+        }
+    }
+
+    # The arguments as they were written: a name's value is what follows it
+    # up to the next name, which distinguishes a JSON array from a string
+    # that merely looks like a list. (No names here: this file is built with
+    # subst, which would replace them.)
+    set raw_values {}
+    set arguments {}
+    if {[catch {json::json2dict $raw} value]} {
+        return $raw
+    }
+    set arguments $value
+    if {$arguments eq {}} {
+        return $raw
+    }
+    # A name's value is what follows it up to the next name: an array is
+    # recognized here rather than by the value's shape, because a string
+    # with spaces or newlines looks like a list and is not one. The pattern
+    # avoids a bare close brace, which would end this procedure body.
+    set raw_values {}
+    foreach line [split $raw \n] {
+        foreach {full key value} \
+                [regexp -all -inline {"([^"]*)"[ ]*:[ ]*("(?:[^"\\]|\\.)*"|\[[^[]*\]|[^,]*)} $line] {
+            dict set raw_values $key [string trim $value]
+        }
+    }
+
+    set keys {}
+    foreach key $order {
+        if {[dict exists $arguments $key]} {
+            lappend keys $key
+        }
+    }
+    foreach key [lsort [dict keys $arguments]] {
+        if {$key ni $keys} {
+            lappend keys $key
+        }
+    }
+
+    set width 0
+    foreach key $keys {
+        if {[string length $key] > $width} {
+            set width [string length $key]
+        }
+    }
+
+    set out {}
+    foreach key $keys {
+        set value [dict get $arguments $key]
+        set as_written {}
+        if {[dict exists $raw_values $key]} {
+            set as_written [dict get $raw_values $key]
+        }
+        if {[string match "\[*" $as_written]} {
+            # A JSON array: show it as one.
+            set value "\[[join $value {, }]\]"
+        }
+        if {[string first \n $value] >= 0} {
+            append out "$key:\n$value\n"
+        } else {
+            # Padded with spaces, counted in characters: format's %-*s is
+            # meant for display columns and misaligns past the first.
+            append out "$key:[string repeat { } [expr {$width + 2 - [string length $key] - 1}]]$value\n"
+        }
+    }
+    return $out
+}
+
+
 proc ::featherweight::ui_tool_code {call {time {}}} {
     set function [dict get $call function]
+    set name [dict get $function name]
     set arguments [dict get $function arguments]
-    if {[dict get $function name] eq {run_code}
-            && ![catch {json::json2dict $arguments} decoded]
-            && [dict exists $decoded code]} {
-        set code [dict get $decoded code]
-    } else {
-        set code $arguments
+    if {$name eq {run_code}} {
+        if {![catch {json::json2dict $arguments} decoded]
+                && [dict exists $decoded code]} {
+            set arguments [dict get $decoded code]
+        }
+        ui_label "Tool code" $time
+        ui_append tool "$arguments\n\n"
+        return
     }
-    ui_label "Tool code" $time
-    ui_append tool "$code\n\n"
+    ui_label "Tool call: $name" $time
+    ui_append tool "[tool_arguments_text $name $arguments]\n"
 }
 
 
 proc ::featherweight::ui_tool {text {time {}}} {
-    ui_label "Tool" $time
+    ui_label "Tool result" $time
     ui_append tool "$text\n\n"
 }
 
