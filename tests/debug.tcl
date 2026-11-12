@@ -126,7 +126,7 @@ ok "request prints the model, counts and the payload" {
     expr {[dict get $r code] == 0
         && [string first {session:  default} [dict get $r output]] >= 0
         && [string first {model:} [dict get $r output]] >= 0
-        && [string first {tools:    5 schemas} [dict get $r output]] >= 0
+        && [string first {tools:    6 schemas} [dict get $r output]] >= 0
         && [string first {"messages"} [dict get $r output]] >= 0
         && [string first {automatic fold:} [dict get $r output]] >= 0}
 }

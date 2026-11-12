@@ -84,6 +84,16 @@ Use run_code for other operations in the user's environment.} \
             -description {Report facts about this Featherweight process: its version and script, when the process started, the current date and time, the Tcl and Tk versions, the platform, and this session's model and project root. Use it instead of inferring any of these.}
             -command ::featherweight::tool_about
         }
+        recall {
+            -name recall
+            -description {Search this session's record: every message of the session as it was said, including earlier turns that have been compacted, summarized or dropped from this conversation. Use it to find something said, read or worked out earlier that you can no longer see. Matches in messages still in this conversation are counted, not shown. Results are newest first; each hit has an id, which you can pass back to see that message whole.}
+            -param {pattern string {An FTS5 full-text query, as SQLite's MATCH takes: words are ANDed, or finds either, "words in quotes" is a phrase, word* matches a prefix, -word excludes. A query that is not valid FTS5 is searched for as a phrase. Required unless id is given.}}
+            -param {from string {Which messages to search: "conversation" (the default) is what the user and you said; "tools" is tool output and tool calls; "all" is both.}}
+            -param {newest integer {How many matching messages to show, newest first. Default 10, at most 50.}}
+            -param {id string {Optional. A hit's id, such as "t4.3", to see that message whole; lines matching pattern, if one is given, are marked.}}
+            -param {session string {Which session's record to search: the current one by default; name another to search it instead.}}
+            -command ::featherweight::tool_recall
+        }
     }]
     variable process_started [clock seconds]
 }
@@ -653,10 +663,15 @@ proc ::featherweight::user_texts messages {
 
 
 proc ::featherweight::roll_note texts {
-    set text {Earlier turns of this session were dropped to keep it inside the context window. What the user said in them is kept below, word for word, oldest first. The work those turns did is not kept: where it matters, check the files or run the commands again.}
+    set text {Earlier turns of this session were dropped to keep it inside the context window. What the user said in them is quoted below, word for word, oldest first; the rest of those turns is in the session record.}
     foreach message $texts {
         append text "\n\n> [string map [list "\n" "\n> "] $message]"
     }
+    # The pointer is in two places, as Strument's recall experiments settled:
+    # a clause in the label read first, and the instruction after the quotes,
+    # nearest the turn that needs it. Without it models answer "I don't know"
+    # with the answer one search away.
+    append text "\n\nThe rest of those turns, including your own replies and the output of every tool call, is kept in the session record, and the recall tool searches it. When a question concerns something said, read or worked out in those turns, search the record before deciding you don't know; file contents and command output need from=\"all\". Re-read a file only when its current contents are what you need."
     return [harness_note $text]
 }
 
@@ -1745,6 +1760,431 @@ proc ::featherweight::write_text_file {path content} {
         catch {file delete -force $temporary}
         return -options $options $error
     }
+}
+
+
+# --- recall: the session record as memory ---
+#
+# Compaction loses the model's own results. A summary keeps what the user
+# said and none of what the work found out; asked about it later the model
+# can only say it does not know, with the answer one search away on disk.
+# The record keeps all of it -- that is what the markers are for -- and
+# recall searches the record. The design is Strument's
+# (doc/experiments/2026-10-recall and the studies after it): shaped like
+# grep, hits newest first with ids that open a message whole, matches still
+# in the conversation counted rather than shown, and recall's own results
+# left out so a search cannot find its previous answers. The query is raw
+# FTS5 rather than a regexp: an ephemeral SQLite database in memory indexes
+# the whole record in about ten milliseconds, and models write FTS5.
+
+# The record as search entries, one per message, numbered tN.M by turn: a
+# turn is what a genuine user message starts, and t4.3 is the third message
+# of the fourth. Markers contribute the summary they carry. Recall's own
+# tool results are left out: they are copies of the record, so a search
+# would find its own previous answers and make a fact look better attested
+# than it is.
+proc ::featherweight::recall_entries {name} {
+    set path [session_path $name]
+    if {![file exists $path]} {
+        return -code error "no session [list $name]"
+    }
+    set records [session_records [::fileutil::cat -encoding utf-8 $path]]
+
+    # What each tool call was named, so a result can say which tool made it.
+    set tool_names {}
+    foreach record $records {
+        if {![is_message $record] || ![dict exists $record tool_calls]} {
+            continue
+        }
+        foreach call [dict get $record tool_calls] {
+            if {[dict exists $call id] && [dict exists $call function name]} {
+                dict set tool_names [dict get $call id] [dict get $call function name]
+            }
+        }
+    }
+
+    set stream {}
+    foreach record $records {
+        if {[is_marker $record]} {
+            if {[dict exists $record summary]} {
+                foreach message [dict get $record summary] {
+                    lappend stream $message
+                }
+            }
+            continue
+        }
+        lappend stream $record
+    }
+
+    set entries {}
+    set turn 1
+    set index 0
+    set seen_user 0
+    foreach message $stream {
+        set role [dict get $message role]
+        set tool {}
+        if {$role eq {tool}} {
+            set call {}
+            if {[dict exists $message tool_call_id]} {
+                set call [dict get $message tool_call_id]
+            }
+            if {[dict exists $tool_names $call]} {
+                set tool [dict get $tool_names $call]
+            }
+            if {$tool eq {recall}} {
+                continue
+            }
+        } elseif {$role eq {user} && ![is_harness_note $message]} {
+            if {$seen_user} {
+                incr turn
+                set index 0
+            }
+            set seen_user 1
+        }
+
+        set text {}
+        catch {set text [content_display [dict get $message content]]}
+        if {[dict exists $message tool_calls]} {
+            foreach call [dict get $message tool_calls] {
+                catch {
+                    append text \n [dict get $call function name] { } \
+                        [dict get $call function arguments]
+                }
+            }
+        }
+        if {[string trim $text] eq {}} {
+            continue
+        }
+
+        set time {}
+        if {[dict exists $message time]} {
+            set time [dict get $message time]
+        }
+        incr index
+        lappend entries [dict create id t$turn.$index turn $turn \
+            role $role tool $tool time $time record $message text $text]
+    }
+    return $entries
+}
+
+
+# Whether an entry is in the scope a search asked for. Nearly all the noise
+# is in tool output -- the files the model read -- while the model's own
+# results are stated in its prose, so the two are searched apart.
+proc ::featherweight::recall_in_scope {entry from} {
+    if {$from eq {all}} {
+        return 1
+    }
+    if {$from eq {tools}} {
+        return [expr {[dict get $entry role] eq {tool}}]
+    }
+    return [expr {[dict get $entry role] ne {tool}}]
+}
+
+
+# A message's line, shortened around the query's first mark: a minified file
+# or a long JSON line would otherwise be the whole result.
+proc ::featherweight::recall_clip {line} {
+    if {[string length $line] <= 300} {
+        return [string map [list \u0001 {} \u0002 {}] $line]
+    }
+    set at [string first \u0001 $line]
+    set from 0
+    if {$at > 100} {
+        set from [expr {$at - 100}]
+    }
+    set to [expr {$from + 300}]
+    if {$to > [string length $line]} {
+        set to [string length $line]
+    }
+    set line [string range $line $from $to]
+    set out [string map [list \u0001 {} \u0002 {}] $line]
+    if {$from > 0} {
+        set out "\u2026$out"
+    }
+    if {$to < [string length $line]} {
+        append out \u2026
+    }
+    return $out
+}
+
+
+# The lines of one message the query marked, with their context, as grep -C
+# shows them: at most limit matches, lines numbered within the message.
+proc ::featherweight::recall_lines {marked context limit id} {
+    set lines [split $marked \n]
+    set matches {}
+    set number 0
+    foreach line $lines {
+        if {[string first \u0001 $line] >= 0} {
+            lappend matches $number
+        }
+        incr number
+    }
+    if {$matches eq {}} {
+        # The query matches across lines; show where its first mark falls.
+        set before [string first \u0001 $marked]
+        set matches [expr {[llength [split [string range $marked 0 $before] \n]] - 1}]
+    }
+
+    set out {}
+    set last -1
+    set shown 0
+    foreach match $matches {
+        if {$shown >= $limit} {
+            append out "  ([expr {[llength $matches] - $shown}] more matching lines: recall with id=[list $id])\n"
+            break
+        }
+        incr shown
+        set from [expr {$match - $context < $last + 1 ? $last + 1 : $match - $context}]
+        set to [expr {$match + $context > [llength $lines] - 1 ? [llength $lines] - 1 : $match + $context}]
+        if {$last >= 0 && $from > $last + 1} {
+            append out "  ...\n"
+        }
+        for {set i $from} {$i <= $to} {incr i} {
+            append out [format "  %d: %s\n" [expr {$i + 1}] \
+                [recall_clip [lindex $lines $i]]]
+        }
+        set last $to
+    }
+    return $out
+}
+
+
+# One message whole, as the record holds it: at most 400 lines or 40000
+# characters, lines the query marked shown with a >.
+proc ::featherweight::recall_open {entry marked} {
+    set out "[dict get $entry id] \u00b7 turn [dict get $entry turn] \u00b7 [recall_speaker $entry] \u00b7 [recall_time $entry]\n"
+    set lines [split [dict get $entry text] \n]
+    set runes 0
+    set number 0
+    foreach line $lines {
+        if {$number >= 400 || $runes > 40000} {
+            append out "([expr {[llength $lines] - $number}] more lines not shown)\n"
+            break
+        }
+        incr number
+        set mark { }
+        if {[string first \u0001 $line] >= 0} {
+            set mark >
+        }
+        append out [format "%s %d: %s\n" $mark $number \
+            [string map [list \u0001 {} \u0002 {}] $line]]
+        incr runes [string length $line]
+    }
+    return $out
+}
+
+
+proc ::featherweight::recall_speaker entry {
+    if {[dict get $entry role] eq {tool}} {
+        return "tool [dict get $entry tool]"
+    }
+    return [dict get $entry role]
+}
+
+
+proc ::featherweight::recall_time entry {
+    set time [dict get $entry time]
+    if {$time eq {}} {
+        return {}
+    }
+    return [format_time $time]
+}
+
+
+# Search the session record. The query is an FTS5 full-text query; a hit is
+# a message, newest first, and its id opens it whole.
+proc ::featherweight::tool_recall arguments {
+    foreach name {pattern from newest id session} {
+        set $name {}
+        if {[dict exists $arguments $name]} {
+            set $name [dict get $arguments $name]
+        }
+    }
+    if {$pattern eq {} && $id eq {}} {
+        return {Give a "pattern" to search for, or the "id" of a message to see whole.}
+    }
+    if {$from eq {}} {
+        set from conversation
+    }
+    if {$from ni {conversation tools all}} {
+        return "\"from\" must be \"conversation\", \"tools\" or \"all\", not [list $from]."
+    }
+    if {![string is integer -strict $newest] || $newest < 1} {
+        set newest 10
+    }
+    if {$newest > 50} {
+        set newest 50
+    }
+    if {$session eq {}} {
+        set session [current_session_name]
+    }
+    if {[catch {recall_entries $session} entries]} {
+        return $entries
+    }
+
+    # A hit's id passed as the pattern can only match itself, and ids are
+    # not text in the record: open the message instead. A live session did
+    # exactly this, with an id escaped as a pattern, after being refused.
+    if {$id eq {} && [regexp {^t([0-9]+)\\?\.([0-9]+)$} $pattern -> turn message]} {
+        set id t$turn.$message
+        return "[list $pattern] is a message id, not text in the record, so it was opened as id=[list $id].\n[recall_open_id $entries $id]"
+    }
+    if {$pattern eq {}} {
+        return [recall_open_id $entries $id]
+    }
+    if {[catch {package require sqlite3} missing]} {
+        return "The record cannot be searched: $missing"
+    }
+
+    # The record as an ephemeral index, thrown away when the call is done:
+    # over a session of a thousand messages this is about ten milliseconds,
+    # and nothing has to be kept in step with the file as it grows.
+    sqlite3 recall_db :memory:
+    set code [catch {
+        recall_db eval {
+            CREATE VIRTUAL TABLE hit USING
+                fts5(text, tokenize = 'unicode61 remove_diacritics 2')
+        }
+        recall_db eval {BEGIN}
+        set rowid 0
+        foreach entry $entries {
+            incr rowid
+            set text [dict get $entry text]
+            recall_db eval {INSERT INTO hit(rowid, text) VALUES($rowid, $text)}
+        }
+        recall_db eval {COMMIT}
+
+        set note {}
+        set query $pattern
+        if {[catch {
+            set rows [recall_db eval {
+                SELECT rowid, highlight(hit, 0, char(1), char(2))
+                FROM hit WHERE hit MATCH :query
+            }]
+        } why]} {
+            # Not valid FTS5. Search for the words as a phrase, and say so:
+            # a model that meant a query should know it was not used as one.
+            set note "The query is not valid FTS5, so it was searched for as a phrase.\n"
+            set query "\"[string map [list "\"" "\"\""] $pattern]\""
+            set rows [recall_db eval {
+                SELECT rowid, highlight(hit, 0, char(1), char(2))
+                FROM hit WHERE hit MATCH :query
+            }]
+        }
+        list $note $rows
+    } result]
+    recall_db close
+    if {$code} {
+        return "The record could not be searched: $result"
+    }
+    lassign $result note rows
+
+    set marked {}
+    foreach {rowid text} $rows {
+        dict set marked $rowid $text
+    }
+
+    # What the conversation holds now is not shown: the model can see it.
+    array set visible {}
+    foreach message [current_messages] {
+        set visible([list $message]) 1
+    }
+
+    set hits {}
+    set in_view 0
+    set out_of_scope 0
+    for {set i [expr {[llength $entries] - 1}]} {$i >= 0} {incr i -1} {
+        if {![dict exists $marked [expr {$i + 1}]]} {
+            continue
+        }
+        set entry [lindex $entries $i]
+        if {![recall_in_scope $entry $from]} {
+            incr out_of_scope
+            continue
+        }
+        set key [list [dict get $entry record]]
+        if {[info exists visible($key)]} {
+            incr in_view
+            continue
+        }
+        lappend hits [list $entry [dict get $marked [expr {$i + 1}]]]
+    }
+
+    if {$id ne {}} {
+        foreach hit $hits {
+            lassign $hit entry text
+            if {[dict get $entry id] eq $id} {
+                return $note[recall_open $entry $text]
+            }
+        }
+        return $note[recall_open_id $entries $id]
+    }
+
+    set out $note
+    set shown [expr {[llength $hits] < $newest ? [llength $hits] : $newest}]
+    set turns 0
+    foreach entry $entries {
+        if {[dict get $entry turn] > $turns} {
+            set turns [dict get $entry turn]
+        }
+    }
+
+    append out "Recall [list $pattern] in session $session\n"
+    if {$shown == 0} {
+        append out {No matches outside this conversation}
+    } else {
+        append out "[expr {$shown < [llength $hits] ? "Showing $shown of [llength $hits] messages" : "[llength $hits] messages"}] outside this conversation, newest first"
+        if {$shown < [llength $hits]} {
+            append out { (raise newest, or narrow the query, for more)}
+        }
+    }
+    append out .
+
+    # Replies the cutoff hid are named: a search for a word an answer used
+    # matches tool output too, and the answer can fall below the cutoff.
+    set hidden {}
+    foreach hit [lrange $hits $shown end] {
+        lassign $hit entry text
+        if {[dict get $entry role] eq {assistant}} {
+            lappend hidden [dict get $entry id]
+        }
+    }
+    if {$hidden ne {}} {
+        set more {}
+        if {[llength $hidden] > 10} {
+            set more " and [expr {[llength $hidden] - 10}] more"
+            set hidden [lrange $hidden 0 9]
+        }
+        append out " Not shown, your own replies: [join $hidden {, }]$more; pass one as id to see it."
+    }
+    if {$in_view > 0} {
+        append out " $in_view more in messages still in this conversation (not shown)."
+    }
+    if {$out_of_scope > 0} {
+        set other [expr {$from eq {conversation} ? {tool output} : {the conversation}}]
+        append out " $out_of_scope more in $other: pass from=\"all\" to include them."
+    }
+    append out \n
+
+    foreach hit [lrange $hits 0 [expr {$shown - 1}]] {
+        lassign $hit entry text
+        append out "\n[dict get $entry id] \u00b7 turn [dict get $entry turn] of $turns \u00b7 [recall_speaker $entry] \u00b7 [recall_time $entry]\n"
+        append out [recall_lines $text 2 3 [dict get $entry id]]
+    }
+    return $out
+}
+
+
+# Open one entry by id, whether or not it matched a search.
+proc ::featherweight::recall_open_id {entries id} {
+    foreach entry $entries {
+        if {[dict get $entry id] eq $id} {
+            return [recall_open $entry {}]
+        }
+    }
+    return "No message has the id [list $id]. Ids look like \"t4.3\" and come from a search's results."
 }
 
 
