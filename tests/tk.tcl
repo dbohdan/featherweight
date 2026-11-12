@@ -132,12 +132,12 @@ set ::featherweight::sessions [dict create]
 check "the folded history matches what is on disk" \
     {[llength [::featherweight::current_messages]] == $memory_count}
 
-# A model turn can change what the title shows: run_code changes the model
-# here, the way it could cd or move harness state any other way.
+# A model turn can change what the title shows: the code it runs reaches the
+# harness through ::run_code::harness, whether to change the model or to cd.
 set ::featherweight::busy 1
 ::featherweight::apply_message [dict create role assistant tool_calls [list \
     [dict create type function id title-check function [dict create name run_code \
-        arguments {{"code": "dict set ::featherweight::config model from-tool"}}]]]]
+        arguments {{"code": "harness {dict set ::featherweight::config model from-tool}"}}]]]]
 set ::featherweight::busy 0
 check "a model turn refreshes the title" \
     {[wm title .] eq "Featherweight - [file tail [pwd]]/ - from-tool"}

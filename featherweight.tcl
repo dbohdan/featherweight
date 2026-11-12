@@ -21,6 +21,8 @@ namespace eval ::featherweight {
         context_size 1048576 \
         retries 5 \
         timeout 300 \
+        exec_timeout 60 \
+        run_code_timeout 300 \
         timestamp_format {%Y-%m-%d %H:%M:%S %z} \
         system_prompt {You are an expert software developer working with a user on their code.
 The user will ask for changes to the code, or ask questions about it.
@@ -42,11 +44,10 @@ Use run_code for other operations in the user's environment.} \
     # Empty means the ordinary launch-directory state.
     variable state_root {}
 
-    variable run_code_output {}
     variable tools_available [subst {
         run_code {
             -name run_code
-            -description {Evaluate code in a stateful Tcl [info patchlevel] interp that the harness runs in. State persists between calls. Tcllib is available. You receive the return value plus whatever the code writes to stdout/stderr.}
+            -description {Evaluate Tcl code in an interpreter of its own. Tcllib is available. You receive the return value plus whatever the code writes to stdout/stderr. State does not persist between calls, so use files for anything that must survive. Commands run through exec are killed when they run past a timeout (60s by default): pass -timeout to exec -- for example exec -timeout 5m make -- when you expect a long run. The call as a whole is stopped after 5m; ::run_code::deadline gives it more time. Read or change the harness's own state -- its configuration, its sessions, its interface -- with ::run_code::harness {script}, which returns the script's result.}
             -param {code string {The code to evaluate.}}
             -required code
             -command ::featherweight::tool_run_code
@@ -225,6 +226,28 @@ proc ::featherweight::init_config {} {
     set timeout [dict get $config timeout]
     if {![string is integer -strict $timeout] || $timeout < 1} {
         error {timeout must be an integer of at least 1 second}
+    }
+
+    # How long one command the model runs may take before it is killed. In
+    # seconds; the model can set it lower or higher for a single call.
+    if {![dict exists $config exec_timeout]} {
+        dict set config exec_timeout 60
+    }
+    set exec_timeout [dict get $config exec_timeout]
+    if {![string is integer -strict $exec_timeout] || $exec_timeout < 1} {
+        error {exec_timeout must be an integer of at least 1 second}
+    }
+    set ::run_code::timeout [expr {$exec_timeout * 1000}]
+
+    # How long one run_code call may take in all, code and commands
+    # together, before it is stopped. In seconds. The model can ask for more
+    # time for a single call with ::run_code::deadline.
+    if {![dict exists $config run_code_timeout]} {
+        dict set config run_code_timeout 300
+    }
+    set run_code_timeout [dict get $config run_code_timeout]
+    if {![string is integer -strict $run_code_timeout] || $run_code_timeout < 1} {
+        error {run_code_timeout must be an integer of at least 1 second}
     }
 
     # The current session must name a session file; anything else starts over
@@ -951,8 +974,29 @@ proc ::featherweight::json_payload {model json_tools messages} {
 }
 
 
-proc ::featherweight::puts args {
-    variable run_code_output
+# The namespace the run_code tool and /eval evaluate model code in. Its puts
+# and exec shadow the Tcl commands of the same names, so that the output is
+# captured and that no child process is left running without a timeout. This
+# is not a sandbox: model code has the full interpreter and can reach the
+# harness by name.
+namespace eval ::run_code {
+    variable output {}
+    # The default limit on one command, in milliseconds. A command that runs
+    # longer is killed and reported as timed out; see exec_timeout in the
+    # configuration, and -timeout on a single call.
+    variable timeout 60000
+    # Names the per-run state of a command in flight.
+    variable run_number 0
+    # The harness's thread, for harness. Empty when the code runs in the
+    # harness itself.
+    variable harness_tid {}
+}
+
+
+# Run the code a tool or /eval was given. The output it prints is collected
+# here rather than sent to the process's stdout.
+proc ::run_code::puts args {
+    variable output
 
     set prefix {}
     if {[lindex $args 0] eq {-nonewline}} {
@@ -976,7 +1020,7 @@ proc ::featherweight::puts args {
     }
 
     if {$channel in {stdout stderr}} {
-        append run_code_output $text [expr {$prefix eq {-nonewline} ? {} : "\n"}]
+        append output $text [expr {$prefix eq {-nonewline} ? {} : "\n"}]
         return
     }
 
@@ -984,9 +1028,501 @@ proc ::featherweight::puts args {
 }
 
 
+# Run a script in the harness and return its result. The code a tool call is
+# given runs in a thread of its own, and this is its way to the harness's own
+# state -- the configuration, the sessions, the interface -- which lives in
+# the harness's thread. In the harness itself this is an eval at the top
+# level. Tk belongs to the harness too, so widgets are built through this.
+proc ::run_code::harness {script} {
+    variable harness_tid
+
+    if {$harness_tid eq {}} {
+        return [uplevel #0 $script]
+    }
+    return [thread::send $harness_tid $script]
+}
+
+
+# Ask for more time than the call's limit allows: 30m, 2h. Meant for a
+# computation that would otherwise be stopped when the limit runs out.
+proc ::run_code::deadline {value} {
+    harness [list ::featherweight::run_code_deadline [duration $value]]
+}
+
+
+# A duration as the model may write it -- 30, 30s, 2m, 1h -- in milliseconds.
+proc ::run_code::duration {value} {
+    if {![regexp {^([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)?$} $value -> number unit]} {
+        return -code error "bad duration [list $value]: use 30, 30s, 2m or 1h"
+    }
+    switch -- $unit {
+        ms { return [expr {int($number)}] }
+        m { return [expr {int($number * 60000)}] }
+        h { return [expr {int($number * 3600000)}] }
+        default { return [expr {int($number * 1000)}] }
+    }
+}
+
+
+# The command that reports a timeout, in words a model can act on.
+proc ::run_code::timeout_message {command milliseconds tree} {
+    set seconds [expr {$milliseconds / 1000.0}]
+    set message "timed out after [format %g $seconds]s: $command. The command was killed"
+    if {$tree} {
+        append message ", along with the processes it started"
+    } else {
+        append message "; processes it started may still be running"
+    }
+    return $message
+}
+
+
+# Run a tool's code and answer in the harness's words: what it printed, what
+# it returned, and how it ended. Both the harness and a worker thread use
+# this, so the answer reads the same wherever the code ran.
+proc ::run_code::execute {code} {
+    variable output
+
+    set output {}
+    set value {}
+    catch {namespace eval ::run_code $code} value options
+
+    return [join [list \
+        <output>$output</output> \
+        <result>$value</result>  \
+        <options>$options</options> \
+    ] \n]
+}
+
+
+# One tool call in a worker thread: run the code, then hand the answer to the
+# harness, which is waiting for it.
+proc ::run_code::call {code main_tid token} {
+    variable harness_tid
+
+    package require Thread
+    set harness_tid $main_tid
+    set payload [execute $code]
+    thread::send -async $main_tid [list ::featherweight::run_code_arrived $token $payload]
+}
+
+
+# Run a command with a timeout, the way exec does but never hanging forever.
+#
+# Tcl's exec blocks the interpreter, so no timer can fire while it runs: the
+# command is run as an asynchronous pipeline instead, and a watchdog in this
+# interpreter -- which does get to run, because vwait services events -- kills
+# it when the time is up. The call still blocks until the command is done or
+# the timer goes off, so it reads like exec to the caller.
+#
+#   exec ?-timeout duration? ?-keepnewline? ?-ignorestderr? ?--? arg ...
+#
+# A duration may be 30, 30s, 2m or 1h. The default comes from exec_timeout in
+# the configuration. On timeout the command's process group is killed where
+# the platform supports it -- setsid on Unix, taskkill /T on Windows -- so
+# that the children it started go with it; without that only the command
+# itself dies and the message says so.
+proc ::run_code::exec args {
+    variable timeout
+
+    set limit $timeout
+    set ignorestderr 0
+    set keepnewline 0
+    set command {}
+    set want_timeout 0
+    set parsing 1
+    foreach arg $args {
+        if {$want_timeout} {
+            set limit [duration $arg]
+            set want_timeout 0
+            continue
+        }
+        if {$parsing} {
+            switch -- $arg {
+                -timeout {
+                    set want_timeout 1
+                    continue
+                }
+                -ignorestderr {
+                    set ignorestderr 1
+                    continue
+                }
+                -keepnewline {
+                    set keepnewline 1
+                    continue
+                }
+                -- {
+                    set parsing 0
+                    continue
+                }
+            }
+            # Like exec's own options, the first word that is not one starts
+            # the command: everything after it is a word of the command.
+            set parsing 0
+        }
+        lappend command $arg
+    }
+    if {$want_timeout} {
+        return -code error {missing value for -timeout}
+    }
+    if {![llength $command]} {
+        return -code error {wrong # args: should be "exec ?-timeout duration? ?-keepnewline? ?-ignorestderr? ?--? arg ..."}
+    }
+
+    set started [clock milliseconds]
+    set failure [run $command $ignorestderr $limit output error pid tree errcode]
+    set elapsed [expr {[clock milliseconds] - $started}]
+
+    # Like exec, the newline the command ended with is not part of the
+    # answer unless -keepnewline says otherwise.
+    if {!$keepnewline && [string match *\n $output]} {
+        set output [string range $output 0 end-1]
+    }
+
+    if {$failure eq {timeout}} {
+        return -options [dict create -code error -errorcode [list CHILDKILLED $pid SIGTERM]] \
+            [timeout_message $command $limit $tree]
+    }
+    if {$failure eq {start}} {
+        return -code error $error
+    }
+    if {$failure eq {status}} {
+        # Like exec, a command that fails raises whatever it wrote; when it
+        # wrote nothing, exec's own wording stands.
+        set message $output
+        if {$message eq {}} {
+            set message $error
+        }
+        return -options [dict create -code error -errorcode $errcode] $message
+    }
+    return $output
+}
+
+
+# Run one command and wait for it, collecting what it wrote. Returns a
+# failure name -- {}, timeout, start or status -- with the rest of the
+# details in the caller's variables.
+proc ::run_code::run {command ignorestderr limit outvar errvar pidvar treevar errcodevar} {
+    upvar 1 $outvar output $errvar error $pidvar pid $treevar tree $errcodevar errcode
+
+    set output {}
+    set error {}
+    set errcode [list CHILDSTATUS 0 1]
+    set tree 0
+    set pid {}
+
+    # The command is run on its own: no setsid, since it forks at its own
+    # discretion and the pid would then name a process already gone. A
+    # timeout kills the command itself; see kill_command. The empty string
+    # on its standard input stands in for the null device that exec gives a
+    # command, so that one that reads input sees end of file instead of
+    # waiting for input that will never come. The stderr redirect has to
+    # stay the last word for open to accept it.
+    set tail [concat [list << {}] $command]
+    if {!$ignorestderr} {
+        lappend tail 2>@1
+    }
+
+    if {[catch {open |$tail r} channel]} {
+        set error "could not start: $channel"
+        return start
+    }
+    fconfigure $channel -blocking 0
+    set pid [lindex [pid $channel] 0]
+
+    # Registered with the harness, so that the watchdog can find this
+    # process and stop it whatever the code is doing meanwhile.
+    catch {harness [list ::featherweight::run_code_child add $pid]}
+
+    # The reader and the timer both wake the same variable, named per run so
+    # that a command started from inside another does not disturb it.
+    variable run_number
+    set key r[incr run_number]
+    set ::run_code::$key [dict create channel $channel eof 0 output {}]
+    fileevent $channel readable [list ::run_code::drain $key]
+    set ::run_code::wakeup$key 0
+    set timer [after $limit [list set ::run_code::wakeup$key 1]]
+
+    vwait ::run_code::wakeup$key
+    after cancel $timer
+    catch {harness [list ::featherweight::run_code_child remove $pid]}
+
+    set state [set ::run_code::$key]
+    set output [dict get $state output]
+
+    if {![dict get $state eof]} {
+        set tree [kill_command $pid]
+        catch {close $channel}
+        unset -nocomplain ::run_code::$key ::run_code::wakeup$key
+        return timeout
+    }
+
+    # Back to blocking first: close on a pipeline left non-blocking returns
+    # without reporting how the command ended, and the point of asking is to
+    # see a command that failed.
+    fconfigure $channel -blocking 1
+    set status [catch {close $channel} error close_options]
+    unset -nocomplain ::run_code::$key ::run_code::wakeup$key
+    if {$status} {
+        set errcode [dict get $close_options -errorcode]
+        return status
+    }
+    return {}
+}
+
+
+# Read what a command has written so far.
+proc ::run_code::drain {key} {
+    set state [set ::run_code::$key]
+    set channel [dict get $state channel]
+    dict set state output [dict get $state output][read $channel]
+    if {[eof $channel]} {
+        fileevent $channel readable {}
+        dict set state eof 1
+        set ::run_code::wakeup$key 1
+    }
+    set ::run_code::$key $state
+}
+
+
+# Signall a process and every process below it, so that the children a
+# command started go with it. On Windows taskkill walks the tree in one call;
+# elsewhere the descendants are found through ps, because a process group
+# cannot be relied on here: setsid forks at its own discretion and the pid
+# then names a process already gone.
+proc ::run_code::signal_tree {pid signal} {
+    if {$::tcl_platform(platform) eq {windows}} {
+        if {$signal eq {KILL}} {
+            catch {::exec taskkill /PID $pid /T /F}
+        } else {
+            catch {::exec taskkill /PID $pid /T}
+        }
+        return
+    }
+    foreach target [concat [list $pid] [descendants $pid]] {
+        catch {::exec kill -$signal $target}
+    }
+}
+
+
+# Stop a command and the processes it started: a polite signal first, so a
+# well-behaved process can finish what it was doing, and a hard one after a
+# second. Tcl has no kill of its own, so the system's kill sends the signal.
+proc ::run_code::kill_command {pid} {
+    signal_tree $pid TERM
+    after 1000
+    signal_tree $pid KILL
+    return 1
+}
+
+
+# Every process below the given one, grandchildren included.
+proc ::run_code::descendants {pid} {
+    set out {}
+    catch {
+        set children [dict create]
+        foreach line [split [::exec ps -eo pid=,ppid=] \n] {
+            lassign $line child parent
+            if {$child eq {} || $parent eq {}} {
+                continue
+            }
+            dict lappend children $parent $child
+        }
+        set queue [list $pid]
+        while {[llength $queue]} {
+            set parent [lindex $queue end]
+            set queue [lrange $queue 0 end-1]
+            if {![dict exists $children $parent]} {
+                continue
+            }
+            foreach child [dict get $children $parent] {
+                lappend out $child
+                lappend queue $child
+            }
+        }
+    }
+    return $out
+}
+
+
+# --- run_code: the code a tool call is given ---
+#
+# That code runs in a thread of its own, so that code which hangs -- a loop
+# that never ends, a command that waits forever -- takes its own thread down
+# and not the interface with it. A watchdog here in the harness stops the
+# call when its deadline passes; see run_code_expire. The thread is thrown
+# away after every call, so nothing one call does can reach the next. Without
+# the Thread package the code runs here as it always has, with only the exec
+# timeouts to bound it.
+
+proc ::featherweight::run_code_support {} {
+    # The code a worker thread needs: the ::run_code namespace and its
+    # commands, taken from this interpreter so the two copies cannot drift
+    # apart.
+    set script "package require Thread\n"
+    append script "namespace eval ::run_code \{\n"
+    append script "    variable output \{\}\n"
+    append script "    variable timeout [set ::run_code::timeout]\n"
+    append script "    variable run_number 0\n"
+    append script "    variable harness_tid \{\}\n"
+    append script "\}\n"
+    foreach name [lsort [info procs ::run_code::*]] {
+        append script [list proc $name [info args $name] [info body $name]] \n
+    }
+    return $script
+}
+
+
+# The child processes of the call in flight, so that the watchdog can find
+# them however the call is spending its time.
+proc ::featherweight::run_code_child {operation pid} {
+    variable run_code_children
+
+    if {$operation eq {add}} {
+        set run_code_children($pid) 1
+    } else {
+        unset -nocomplain run_code_children($pid)
+    }
+}
+
+
+# The worker's answer to one call. An answer for a call the watchdog has
+# already stopped is dropped: the timeout has the last word.
+proc ::featherweight::run_code_arrived {token payload} {
+    variable run_code_expired
+    variable run_code_payload
+
+    if {[info exists run_code_expired($token)]} { return }
+    set run_code_payload($token) $payload
+}
+
+
+# ::run_code::deadline from model code: give the call in flight more time.
+proc ::featherweight::run_code_deadline {milliseconds} {
+    variable run_code_limit
+    variable run_code_timer
+    variable run_code_token
+
+    if {![info exists run_code_token] || $run_code_token eq {}} {
+        return -code error {no run_code call is in progress}
+    }
+    after cancel $run_code_timer
+    set run_code_limit $milliseconds
+    set run_code_timer [after $milliseconds \
+        [list ::featherweight::run_code_expire $run_code_token timeout]]
+    return $milliseconds
+}
+
+
+# Run one tool call to its answer. The call blocks here -- the model is
+# waiting -- but the interface does not: this wait runs the event loop, which
+# is what lets the watchdog and the Stop button work during a call.
+proc ::featherweight::run_code_call code {
+    variable config
+
+    if {[catch {package require Thread}]} {
+        return [::run_code::execute $code]
+    }
+    if {[catch {set worker [thread::create {thread::wait}]}]} {
+        return [::run_code::execute $code]
+    }
+
+    variable run_code_children
+    variable run_code_expired
+    variable run_code_limit
+    variable run_code_payload
+    variable run_code_serial
+    variable run_code_thread
+    variable run_code_timer
+    variable run_code_token
+
+    array unset run_code_children
+    set token r[incr run_code_serial]
+    set run_code_token $token
+
+    set run_code_thread $worker
+    thread::send $worker [run_code_support]
+
+    set run_code_limit [expr {[dict get $config run_code_timeout] * 1000}]
+    set run_code_timer [after $run_code_limit \
+        [list ::featherweight::run_code_expire $token timeout]]
+    thread::send -async $worker [list ::run_code::call $code [thread::id] $token]
+
+    vwait ::featherweight::run_code_payload($token)
+    after cancel $run_code_timer
+    catch {thread::release $worker}
+    set run_code_token {}
+    set result $run_code_payload($token)
+    unset -nocomplain run_code_payload($token) run_code_expired($token)
+    return $result
+}
+
+
+# The watchdog behind one call. A call that runs past its deadline -- or that
+# the user stopped -- goes in steps: its child processes first, since the
+# operating system can kill those whatever the thread is doing, then the
+# thread's own evaluation, and finally the thread itself, which is dropped
+# and the call reported for what it was.
+proc ::featherweight::run_code_expire {token reason} {
+    variable run_code_children
+    variable run_code_expired
+    variable run_code_token
+
+    if {![info exists run_code_token] || $run_code_token ne $token} { return }
+
+    set run_code_expired($token) 1
+    foreach pid [array names run_code_children] {
+        ::run_code::signal_tree $pid TERM
+    }
+    after 1000 [list ::featherweight::run_code_kill $token]
+    after 2000 [list ::featherweight::run_code_abandon $token $reason]
+}
+
+
+proc ::featherweight::run_code_kill token {
+    variable run_code_children
+    variable run_code_thread
+    variable run_code_token
+
+    if {![info exists run_code_token] || $run_code_token ne $token} { return }
+
+    foreach pid [array names run_code_children] {
+        ::run_code::signal_tree $pid KILL
+    }
+    catch {thread::cancel $run_code_thread}
+}
+
+
+proc ::featherweight::run_code_abandon {token reason} {
+    variable run_code_children
+    variable run_code_limit
+    variable run_code_payload
+    variable run_code_thread
+    variable run_code_token
+
+    if {![info exists run_code_token] || $run_code_token ne $token} { return }
+
+    catch {thread::cancel $run_code_thread}
+    array unset run_code_children
+
+    if {$reason eq {stopped}} {
+        set message {the call was stopped before the code finished.}
+    } else {
+        set message "timed out after [format %g [expr {$run_code_limit / 1000.0}]]s:"
+        append message { the code was still running and was stopped.}
+        append message { Ask for more time with ::run_code::deadline if it needs it;}
+        append message { commands can pass -timeout to exec.}
+    }
+    set run_code_payload($token) [join [list \
+        <output></output> \
+        <result>$message</result> \
+        <options>[dict create -code 1 -errorcode {FEATHERWEIGHT RUN_CODE_TIMEOUT}]</options> \
+    ] \n]
+}
+
+
 proc ::featherweight::tool_run_code arguments {
     variable config
-    variable run_code_output
 
     if {[dict get $config debug]} {
         # Folded, with the tool's name in its header, the way a call is: the
@@ -995,18 +1531,7 @@ proc ::featherweight::tool_run_code arguments {
         debug_log tool "run_code $arguments" run_code
     }
 
-    set run_code_output {}
-    set value {}
-
-    catch {
-        namespace eval ::featherweight [dict get $arguments code]
-    } result options
-
-    return [join [list \
-        <output>$run_code_output</output> \
-        <result>$result</result>  \
-        <options>$options</options> \
-    ] \n]
+    return [run_code_call [dict get $arguments code]]
 }
 
 
@@ -1256,6 +1781,21 @@ namespace eval ::featherweight {
     variable attachments {}
     variable request_channels
     array set request_channels {}
+
+    # One run_code call at a time: its number, its thread, its watchdog
+    # timer and deadline, the child processes it has running, and where its
+    # answer lands. See run_code_call.
+    variable run_code_serial 0
+    variable run_code_token {}
+    variable run_code_thread {}
+    variable run_code_timer {}
+    variable run_code_limit 0
+    variable run_code_children
+    array set run_code_children {}
+    variable run_code_payload
+    array set run_code_payload {}
+    variable run_code_expired
+    array set run_code_expired {}
 }
 
 
@@ -1683,10 +2223,14 @@ proc ::featherweight::stop {} {
     variable curl_data
     variable request_channels
     variable retry_count
+    variable run_code_token
 
     if {!$busy} { return }
     set busy 0
     set retry_count 0
+    if {[info exists run_code_token] && $run_code_token ne {}} {
+        run_code_expire $run_code_token stopped
+    }
     foreach ch [array names request_channels] {
         fileevent $ch readable {}
         unset -nocomplain curl_data($ch)
@@ -1856,9 +2400,11 @@ proc ::featherweight::handle_slash_command text {
                 debug_log error {usage: /eval Tcl-code}
                 return 1
             }
-            # Use the same evaluator and output format as the run_code tool.
+            # The same output format as the run_code tool, but evaluated in
+            # the harness's own thread: state from one /eval reaches the
+            # next, unlike a tool call, which starts fresh each time.
             debug_log eval "/eval $arguments"
-            debug_log eval [tool_run_code [dict create code $arguments]]
+            debug_log eval [::run_code::execute $arguments]
         }
         session {
             set name [string trim $arguments]
@@ -2328,8 +2874,10 @@ only debug eval can change what is stored:
       List the stored sessions, print one, or validate every session
       file and the configuration. check exits non-zero on a problem.
   debug eval <tcl-code>
-      Evaluate Tcl in the Featherweight namespace and print what it
-      printed and what it returned. This one can change state.
+      Evaluate Tcl as the run_code tool would and print what it printed
+      and what it returned, in the harness's own thread. Unlike a tool
+      call it keeps its state from one time to the next. This one can
+      change state.
   debug selftest
       Run the scripts in tests/. Exits non-zero if any of them fails.}
 }
@@ -2815,25 +3363,23 @@ proc ::featherweight::script_session {options} {
 }
 
 
-# Evaluate Tcl in the harness namespace, the way /eval and the run_code tool
-# do, with the output on stdout instead of in the debug log.
+# Evaluate Tcl in the ::run_code namespace, the way /eval and the run_code
+# tool do, with the output on stdout instead of in the debug log.
 proc ::featherweight::script_eval {options} {
-    variable run_code_output
-
     if {[llength $options] == 0} {
         usage_error {eval needs Tcl code}
     }
     set code [join $options { }]
 
-    set run_code_output {}
-    if {[catch {namespace eval ::featherweight $code} value detail]} {
+    set ::run_code::output {}
+    if {[catch {namespace eval ::run_code $code} value detail]} {
         ::puts stderr [dict get $detail -errorinfo]
         exit 1
     }
-    if {$run_code_output ne {} && ![string match *\n $run_code_output]} {
-        append run_code_output \n
+    if {$::run_code::output ne {} && ![string match *\n $::run_code::output]} {
+        append ::run_code::output \n
     }
-    ::puts -nonewline stdout $run_code_output
+    ::puts -nonewline stdout $::run_code::output
     ::puts stdout $value
     return 0
 }
