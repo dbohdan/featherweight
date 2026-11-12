@@ -2713,19 +2713,17 @@ proc ::featherweight::ui_append {tag text} {
 }
 
 
-# The heading line of a message: the label in bold, with the message's time
-# beside it in a smaller font when it has one. Three spaces between them: a
-# Tk text has no tab stops, so a tab would land wherever the font's space
-# width puts a multiple of eight, and a fixed separator is the only one that
-# looks the same at every label length.
+# The heading of a message: the time on its own line, then the label in
+# bold, then the text. The date leads because it is context and the label is
+# the anchor of the block; on one line the label's length set the date's
+# indent and long headings pushed it far to the right.
 proc ::featherweight::ui_label {label time} {
     if {$time eq {}} {
         ui_append role "$label\n"
         return
     }
-    ui_append role "$label   "
-    ui_append timestamp [format_time $time]
-    ui_append role "\n"
+    ui_append timestamp "[format_time $time]\n"
+    ui_append role "$label\n"
 }
 
 

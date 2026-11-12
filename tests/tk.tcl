@@ -102,9 +102,11 @@ check "/eval refreshes the title" \
 check "the view timestamps each message" \
     {[regexp {\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}} [$chat get 1.0 end]]}
 set line_dump [$chat dump -text -tag 1.0 {1.0 lineend}]
-check "the timestamp carries its own tag beside the bold label" \
+set next_dump [$chat dump -text -tag 2.0 {2.0 lineend}]
+check "the timestamp has its own tag, on its line above the bold label" \
     {[lsearch -exact $line_dump timestamp] >= 0
-        && [lsearch -exact $line_dump role] >= 0}
+        && [lsearch -exact $line_dump role] < 0
+        && [lsearch -exact $next_dump role] >= 0}
 set sample {0000-00-00 00:00:00 +0000}
 set stamp_font [tag_value $chat timestamp -font]
 set label_font [tag_value $chat role -font]

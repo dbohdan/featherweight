@@ -70,12 +70,13 @@ ok "the result is labelled as one" {
         && [string first {Tool result} $text] < 0}
 }
 
-puts "== the gap between the label and the date =="
+puts "== the date is on its own line above the heading =="
 ::featherweight::ui_label {You} 1700000000
-set line [$chat get end-2l end-1l]
-ok "three spaces, not one" {
-    expr {[string first {You   20} $line] >= 0
-        && [string first {You 20} $line] < 0}
+set text [$chat get 1.0 end]
+set stamp [::featherweight::format_time 1700000000]
+ok "the date leads, on its own line" {
+    expr {[string first "$stamp\nYou\n" $text] >= 0
+        && ![string match "*You   $stamp*" $text]}
 }
 
 puts "== run_code still shows its code =="
