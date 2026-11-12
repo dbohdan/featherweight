@@ -89,7 +89,7 @@ set r [run_cli {debug session check}]
 ok "session check reports it and exits non-zero" {
     expr {[dict get $r code] == 1
         && [string first {session broken:} [dict get $r output]] >= 0
-        && [string first {not a message dict} [dict get $r output]] >= 0}
+        && [string first {is not a record dict} [dict get $r output]] >= 0}
 }
 set r [run_cli {debug session list}]
 ok "session list still works and marks it unreadable" {

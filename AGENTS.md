@@ -1,5 +1,24 @@
 # Agent instructions
 
+## Sessions
+
+Session files under `featherweight/sessions/` are **append-only**. Never rewrite,
+truncate, or "tidy up" one: the file is the conversation itself, including anything
+a compaction has cut away.
+
+- A record is a Tcl list — a message (it has a `role`) or a marker (it has a `type`
+  and no `role`). A record's text may span lines; the file stays readable as Tcl.
+- There is **one** way to parse this, and both reading and writing use it:
+  `::featherweight::session_records` and `::featherweight::join_session_records`. A
+  write must never inspect the file's lines directly — a record that spans lines
+  leaves a partial line with an unmatched brace, and the parse fails. This is what
+  hung the harness once.
+- A compaction appends a marker — `{type fold label … summary …}` — whose `summary`
+  is the message list that stands in for what was dropped, followed by the kept tail.
+  Everything above the marker is ignored from then on; the last marker decides what
+  the conversation is. Nothing before it is touched, so a crash mid-compaction cannot
+  lose history.
+
 ## Worklog
 
 Maintain `LOG.md` as the handoff between sessions.

@@ -160,6 +160,100 @@ proc ::featherweight::session_names {} {
 # session with no file yet has no messages; a file that cannot be read or
 # understood is an error rather than an empty session, so that a later save
 # never overwrites it.
+# --- session files ---
+#
+# A session file is a Tcl list of records, one record per line where it can
+# be, but a record's text may span lines: the value of a message's content
+# holds its own newlines, so the file stays readable as Tcl. There is one
+# way to parse this -- parse the whole file as a list -- and both reading and
+# writing use it; a write never inspects the file's lines, because a record
+# that spans lines would leave a partial line with an unmatched brace and
+# the parse would fail. See session_records and join_session_records.
+#
+# Session files are append-only. What is already in one is never rewritten:
+# the file is the conversation itself, including anything a compaction has
+# cut away. A compaction appends a marker record saying "ignore everything
+# above", carrying the summary that stands in for what it cut, and the live
+# conversation becomes that marker and everything after it. Nothing before
+# the marker is touched, so a crash mid-compaction cannot lose history.
+
+# Parse a session file's text into its records. Raises an error naming the
+# record at fault rather than failing partway through.
+proc ::featherweight::session_records {content} {
+    if {[catch {llength $content} count]} {
+        error "session is not a Tcl list"
+    }
+    set records {}
+    for {set index 0} {$index < $count} {incr index} {
+        set record [lindex $content $index]
+        if {[catch {dict keys $record}]} {
+            set shown [string range [list $record] 0 79]
+            error "record $index is not a record dict: $shown"
+        }
+        lappend records $record
+    }
+    return $records
+}
+
+
+# Records as the text a session file holds: one record per line where the
+# record allows it. The counterpart to session_records.
+proc ::featherweight::join_session_records {records} {
+    set text {}
+    foreach record $records {
+        append text [list $record] \n
+    }
+    return $text
+}
+
+
+# What a record is: a message has a role, a marker has a type and no role.
+# A fold's marker carries the summary that stands in for what it cut, as the
+# message it is.
+proc ::featherweight::is_message {record} {
+    if {[catch {dict keys $record}]} {
+        return 0
+    }
+    return [expr {[dict exists $record role] && [dict get $record role] ne {}}]
+}
+
+
+proc ::featherweight::is_marker {record} {
+    if {[catch {dict keys $record}]} {
+        return 0
+    }
+    return [expr {![dict exists $record role]
+        && [dict exists $record type] && [dict get $record type] ne {}}]
+}
+
+
+# The conversation a session holds: its messages, with a marker's summary
+# standing in for everything above it. The summary is the message list the
+# conversation has at the fold point -- the system prompt the fold keeps and
+# the note that replaces what it dropped -- and what follows the marker is
+# what the conversation keeps from there on. A file with no markers,
+# including one from before markers existed, is the conversation in full.
+proc ::featherweight::session_messages {records} {
+    set live {}
+    foreach record $records {
+        if {[is_marker $record]} {
+            if {[dict exists $record summary]} {
+                set live [dict get $record summary]
+            } else {
+                set live {}
+            }
+            continue
+        }
+        if {![is_message $record]} {
+            set shown [string range [list $record] 0 79]
+            error "record is neither a message nor a marker: $shown"
+        }
+        lappend live $record
+    }
+    return $live
+}
+
+
 proc ::featherweight::read_session {name} {
     set path [session_path $name]
     if {![file exists $path]} {
@@ -168,17 +262,13 @@ proc ::featherweight::read_session {name} {
     if {[catch {::fileutil::cat -encoding utf-8 $path} content options]} {
         error "could not load [list $path]: $content" {} [dict get $options -errorinfo]
     }
-    if {[catch {llength $content} count]} {
-        error "session in [list $path] is not a Tcl list"
+    if {[catch {session_records $content} records]} {
+        error "session in [list $path]: $records"
     }
-    for {set index 0} {$index < $count} {incr index} {
-        set message [lindex $content $index]
-        if {[catch {dict get $message role}]} {
-            set shown [string range [list $message] 0 79]
-            error "message $index in [list $path] is not a message dict: $shown"
-        }
+    if {[catch {session_messages $records} messages]} {
+        error "session in [list $path]: $messages"
     }
-    return $content
+    return $messages
 }
 
 
@@ -294,6 +384,32 @@ proc ::featherweight::current_messages {} {
 
 # Write one session back to its own file. A session this process has not read
 # has nothing in memory to write, so it is left alone.
+# Append records to the end of a session file. Session files are append-only:
+# what is already there is never rewritten, because the file is the
+# conversation itself. The file is parsed with the same parser reading it, so
+# a record that spans lines cannot trip this the way a line-by-line look
+# would have. Only a set that changes what came before it -- never made by
+# the app, but possible -- rewrites the file.
+proc ::featherweight::append_session_records {name records} {
+    if {$records eq {}} {
+        return 1
+    }
+    set path [session_path $name]
+    file mkdir [file dirname $path]
+    if {[catch {
+        set channel [open $path a]
+        fconfigure $channel -encoding utf-8 -translation lf
+        puts -nonewline $channel [join_session_records $records]
+        close $channel
+    } error]} {
+        catch {close $channel}
+        debug_log error "could not save [list $path]: $error"
+        return 0
+    }
+    return 1
+}
+
+
 proc ::featherweight::save_session {name} {
     variable sessions
 
@@ -301,13 +417,36 @@ proc ::featherweight::save_session {name} {
         return
     }
 
-    set text {}
-    foreach message [dict get $sessions $name] {
-        append text [list $message] \n
+    set path [session_path $name]
+    file mkdir [file dirname $path]
+    set records [dict get $sessions $name]
+
+    # What the file already holds as a conversation. A fold leaves the
+    # conversation it cut away above the marker, so the file's raw records
+    # are more than the conversation it has now; compare against that.
+    set existing {}
+    if {[file exists $path]} {
+        if {[catch {
+            set existing [session_messages \
+                [session_records [::fileutil::cat -encoding utf-8 $path]]]
+        } error]} {
+            debug_log error "could not save [list $path]: $error"
+            return
+        }
     }
 
-    set path [session_path $name]
-    if {[catch {write_text_file $path $text} error]} {
+    # A set that only adds to what the file already holds appends the
+    # difference. Only a set that changes what came before it -- never made
+    # by the app, but possible -- rewrites the file.
+    if {[llength $records] >= [llength $existing]
+            && [lrange $records 0 [expr {[llength $existing] - 1}]] eq $existing} {
+        append_session_records $name [lrange $records [llength $existing] end]
+        return
+    }
+
+    if {[catch {
+        write_text_file $path [join_session_records $records]
+    } error]} {
         debug_log error "could not save [list $path]: $error"
     }
 }
@@ -522,13 +661,31 @@ proc ::featherweight::roll_note texts {
 }
 
 
-proc ::featherweight::set_current_messages messages {
+# Set what the session holds now. When that is a cut of what was there, the
+# cut is recorded, not made: a marker carrying its summary is appended to the
+# file, and what the conversation keeps is appended after it. Everything
+# above the marker is merely ignored from then on. The conversation that was
+# cut away stays in the file above its marker, whole and recoverable, and
+# nothing already in the file is ever rewritten.
+proc ::featherweight::set_current_messages {messages {folded {}}} {
     variable config
     variable sessions
 
     set name [dict get $config current_session]
     dict set sessions $name $messages
-    save_session $name
+
+    if {$folded eq {}} {
+        save_session $name
+        return
+    }
+
+    # The summary is what stands in for what was cut: the system prompt the
+    # fold keeps and the note that replaces the dropped messages. What
+    # follows the marker is what the conversation keeps from there on.
+    set summary [dict get $folded summary]
+    set tail [lrange $messages [llength $summary] end]
+    set marker [dict merge [dict create type fold cut [llength $summary]] $folded]
+    append_session_records $name [concat [list $marker] $tail]
 }
 
 
@@ -604,16 +761,21 @@ proc ::featherweight::fold_plan {{force 0}} {
     }
 
     set before_count [llength $messages]
+    # What stands in for what the fold drops is the system prompt and the
+    # note: the system prompt is kept outside the fold, so it goes in the
+    # marker's summary with the note that replaces the dropped messages. What
+    # follows the marker in the file is the kept tail.
+    set summary [list [lindex $messages 0] $note]
     set compacted [list [lindex $messages 0] $note {*}[lrange $messages $cut end]]
     set after [messages_tokens $compacted]
     if {$after >= $before} {
         return [dict create fold 0 why no-gain before $before after $after \
             cut $cut said $said note $note before_count $before_count \
-            target $target compacted $compacted]
+            target $target compacted $compacted summary $summary]
     }
     return [dict create fold 1 why done before $before after $after cut $cut \
         said $said note $note before_count $before_count target $target \
-        compacted $compacted]
+        compacted $compacted summary $summary]
 }
 
 
@@ -652,12 +814,15 @@ proc ::featherweight::compact_context {{force 0}} {
         return 0
     }
 
-    set_current_messages [dict get $plan compacted]
     set label {compacted history}
     if {$force} {
         set label {folded on request}
     }
     set cut [dict get $plan cut]
+    set_current_messages [dict get $plan compacted] [dict create \
+        label $label \
+        summary [dict get $plan summary] \
+    ]
     set before_count [dict get $plan before_count]
     debug_log tool "$label: dropped [expr {$cut - 1}] of [expr {$before_count - 1}] messages ([dict get $plan before] -> [dict get $plan after] tokens); user messages kept verbatim"
     refresh_session
@@ -715,7 +880,7 @@ proc ::featherweight::append_message message {
     load_session $name
     dict lappend sessions $name $message
 
-    save_session $name
+    append_session_records $name [list $message]
 
     return $message
 }
