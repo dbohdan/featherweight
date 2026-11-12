@@ -1,4 +1,34 @@
 #! /usr/bin/env tclsh
+# Featherweight -- a small agent harness in one file.
+# Copyright (c) 2026 D. Bohdan
+# License: MIT, https://dbohdan.com/mit-license/2026
+#
+# This application is a chat window where a human talks to a language model.
+# It keeps the conversation, decides what of it fits in the model's context
+# window, sends the request, and runs whatever tools the answer asks for.
+# The core loop is:
+#
+#   The human's message is added to the session
+#     -> The session, folded to fit, goes out to the model as JSON
+#     -> The answer may name tools; each runs and its result is appended
+#     -> The loop repeats until the answer names no tools
+#
+# The parts in the order this file introduces them:
+#
+#   state      what the process holds: the configuration, the session it
+#              shows, its windows
+#   record     sessions on disk: append-only files of messages and fold
+#              markers, readable as a Tcl list
+#   size       counting what a request costs, and folding history to fit
+#   wire       the JSON a request is made of
+#   tools      the tools the model calls -- files, Tcl code, recall --
+#              and the call that runs one
+#   turn       one request and its response, tool calls and all
+#   interface  the Tk conversation, its debug log, and its commands
+#   script     the same state without a window, to inspect and replay
+#
+# With no arguments the interface starts. Script mode prints instead of
+# showing: tclsh featherweight.tcl debug --help.
 
 package require Tcl 8.6 9
 
@@ -99,6 +129,73 @@ Use run_code for other operations in the user's environment.} \
 }
 
 
+namespace eval ::featherweight {
+    variable W {}
+    variable json_tools {}
+    variable busy 0
+    variable done 0
+
+    # How many times the current request has been sent again after a failure.
+    variable retry_count 0
+
+    # The color of each debug category. A fold marker's underline is drawn
+    # in the color of the tag that sets it, so the marker's own tag carries
+    # both the underline and its color -- set the color anywhere else and
+    # Tk draws the line in the widget's foreground instead.
+    variable debug_colors [dict create \
+        error #ff6b6b \
+        request #4fc3f7 \
+        response #a5d6a7 \
+        tool #ce93d8 \
+    ]
+
+# Collapsible debug entries: their number, and which of them are open.
+    variable debug_entry 0
+    array set debug_open {}
+
+    # Images waiting to go out with the next user message: name and stored path.
+    variable attachments {}
+    variable request_channels
+    array set request_channels {}
+
+    # One run_code call at a time: its number, its thread, its watchdog
+    # timer and deadline, the child processes it has running, and where its
+    # answer lands. See run_code_call.
+    variable run_code_serial 0
+    variable run_code_token {}
+    variable run_code_thread {}
+    variable run_code_timer {}
+    variable run_code_limit 0
+    variable run_code_children
+    array set run_code_children {}
+    variable run_code_payload
+    array set run_code_payload {}
+    variable run_code_expired
+    array set run_code_expired {}
+
+    # What immutable messages serialize to and count as, kept so a request
+    # need not work it out three times over. See memo.
+    variable memo_values
+    array set memo_values {}
+    variable memo_used
+    array set memo_used {}
+    variable memo_clock 0
+    variable memo_bytes 0
+
+    # The debug entries whose body has not been built yet: a request or a
+    # tool result can be a megabyte and is folded shut anyway. See
+    # debug_toggle.
+    variable debug_text
+    array set debug_text {}
+
+    # The folded reasoning blocks in the conversation: their number, and
+    # which of them are open. See ui_thinking.
+    variable thinking_serial 0
+    variable thinking_open
+    array set thinking_open {}
+}
+
+
 # The directory that holds the configuration and the sessions, relative to the
 # project root (the launch directory) -- or wherever script mode has pointed
 # it, for a turn replayed against a copy of the state.
@@ -166,122 +263,8 @@ proc ::featherweight::session_names {} {
 }
 
 
-# Read one session from its file, which holds a Tcl list of message dicts. A
-# session with no file yet has no messages; a file that cannot be read or
-# understood is an error rather than an empty session, so that a later save
-# never overwrites it.
-# --- session files ---
-#
-# A session file is a Tcl list of records, one record per line where it can
-# be, but a record's text may span lines: the value of a message's content
-# holds its own newlines, so the file stays readable as Tcl. There is one
-# way to parse this -- parse the whole file as a list -- and both reading and
-# writing use it; a write never inspects the file's lines, because a record
-# that spans lines would leave a partial line with an unmatched brace and
-# the parse would fail. See session_records and join_session_records.
-#
-# Session files are append-only. What is already in one is never rewritten:
-# the file is the conversation itself, including anything a compaction has
-# cut away. A compaction appends a marker record saying "ignore everything
-# above", carrying the summary that stands in for what it cut, and the live
-# conversation becomes that marker and everything after it. Nothing before
-# the marker is touched, so a crash mid-compaction cannot lose history.
-
-# Parse a session file's text into its records. Raises an error naming the
-# record at fault rather than failing partway through.
-proc ::featherweight::session_records {content} {
-    if {[catch {llength $content} count]} {
-        error "session is not a Tcl list"
-    }
-    set records {}
-    for {set index 0} {$index < $count} {incr index} {
-        set record [lindex $content $index]
-        if {[catch {dict keys $record}]} {
-            set shown [string range [list $record] 0 79]
-            error "record $index is not a record dict: $shown"
-        }
-        lappend records $record
-    }
-    return $records
-}
-
-
-# Records as the text a session file holds: one record per line where the
-# record allows it. The counterpart to session_records.
-proc ::featherweight::join_session_records {records} {
-    set text {}
-    foreach record $records {
-        append text [list $record] \n
-    }
-    return $text
-}
-
-
-# What a record is: a message has a role, a marker has a type and no role.
-# A fold's marker carries the summary that stands in for what it cut, as the
-# message it is.
-proc ::featherweight::is_message {record} {
-    if {[catch {dict keys $record}]} {
-        return 0
-    }
-    return [expr {[dict exists $record role] && [dict get $record role] ne {}}]
-}
-
-
-proc ::featherweight::is_marker {record} {
-    if {[catch {dict keys $record}]} {
-        return 0
-    }
-    return [expr {![dict exists $record role]
-        && [dict exists $record type] && [dict get $record type] ne {}}]
-}
-
-
-# The conversation a session holds: its messages, with a marker's summary
-# standing in for everything above it. The summary is the message list the
-# conversation has at the fold point -- the system prompt the fold keeps and
-# the note that replaces what it dropped -- and what follows the marker is
-# what the conversation keeps from there on. A file with no markers,
-# including one from before markers existed, is the conversation in full.
-proc ::featherweight::session_messages {records} {
-    set live {}
-    foreach record $records {
-        if {[is_marker $record]} {
-            if {[dict exists $record summary]} {
-                set live [dict get $record summary]
-            } else {
-                set live {}
-            }
-            continue
-        }
-        if {![is_message $record]} {
-            set shown [string range [list $record] 0 79]
-            error "record is neither a message nor a marker: $shown"
-        }
-        lappend live $record
-    }
-    return $live
-}
-
-
-proc ::featherweight::read_session {name} {
-    set path [session_path $name]
-    if {![file exists $path]} {
-        return {}
-    }
-    if {[catch {::fileutil::cat -encoding utf-8 $path} content options]} {
-        error "could not load [list $path]: $content" {} [dict get $options -errorinfo]
-    }
-    if {[catch {session_records $content} records]} {
-        error "session in [list $path]: $records"
-    }
-    if {[catch {session_messages $records} messages]} {
-        error "session in [list $path]: $messages"
-    }
-    return $messages
-}
-
-
+# Read the configuration, filling in what an older file does not have, and
+# make sure the state it names exists: the directories, the current session.
 proc ::featherweight::init_config {} {
     variable config
 
@@ -369,72 +352,158 @@ proc ::featherweight::init_config {} {
 }
 
 
-# The session's messages, read from its file the first time this process needs
-# them and kept in memory after that.
-proc ::featherweight::load_session {name} {
-    variable sessions
-
-    if {![dict exists $sessions $name]} {
-        dict set sessions $name [read_session $name]
-        # Warm the serialization cache while the interface is idle, so the
-        # first request of a session is not the one that pays for it: on the
-        # 790-message conversation that first serialization is 85ms. See
-        # memo.
-        set messages [dict get $sessions $name]
-        after idle [list ::featherweight::memo_warm $messages]
-    }
-    return [dict get $sessions $name]
-}
-
-
-# Work out what every message serializes to and counts as, so the next call
-# finds it in the cache.
-proc ::featherweight::memo_warm messages {
-    foreach message $messages {
-        catch {message_tokens $message}
-    }
-}
-
-
-proc ::featherweight::current_session_name {} {
+# Write the configuration. Sessions are not part of it: each one is written to
+# its own file by save_session, so this file stays small however long the
+# conversations grow.
+proc ::featherweight::save_config {} {
     variable config
-    return [dict get $config current_session]
-}
 
-
-proc ::featherweight::current_messages {} {
-    return [load_session [current_session_name]]
-}
-
-
-# Write one session back to its own file. A session this process has not read
-# has nothing in memory to write, so it is left alone.
-# Append records to the end of a session file. Session files are append-only:
-# what is already there is never rewritten, because the file is the
-# conversation itself. The file is parsed with the same parser reading it, so
-# a record that spans lines cannot trip this the way a line-by-line look
-# would have. Only a set that changes what came before it -- never made by
-# the app, but possible -- rewrites the file.
-proc ::featherweight::append_session_records {name records} {
-    if {$records eq {}} {
-        return 1
+    set path [config_path]
+    set text {}
+    dict for {key value} $config {
+        append text [list $key $value] \n
     }
-    set path [session_path $name]
-    file mkdir [file dirname $path]
-    if {[catch {
-        set channel [open $path a]
-        fconfigure $channel -encoding utf-8 -translation lf
-        puts -nonewline $channel [join_session_records $records]
-        close $channel
-    } error]} {
-        catch {close $channel}
+
+    if {[catch {write_text_file $path $text} error]} {
         debug_log error "could not save [list $path]: $error"
+    }
+}
+
+
+proc ::featherweight::get_env {name {default %UNSET%}} {
+    if {![info exists ::env($name)]} {
+        if {$default ne {%UNSET%}} {
+            return $default
+        }
+
+        error "environment variable [list $name] unset"
+    }
+
+    return $::env($name)
+}
+
+
+proc ::featherweight::api_key {} {
+    variable config
+
+    return [get_env [dict get $config api_key_env_var]]
+}
+
+
+# --- session files ---
+#
+# A session file is a Tcl list of records, one per line where possible.
+# Message content can contain newlines, so a record may span lines: the file
+# stays readable as Tcl. Reads and writes parse the whole file as a list:
+# parsing individual lines could fail on an unmatched brace. See
+# session_records and join_session_records.
+#
+# Session files are append-only as the conversation grows, retaining even
+# the history cut by compaction: the file is the conversation itself.
+# Compaction appends a marker containing a summary; the live conversation
+# becomes that summary and everything after the marker. Earlier history
+# remains untouched, so a crash during compaction cannot lose it.
+
+# Parse a session file's text into its records. Raises an error naming the
+# record at fault rather than failing partway through.
+proc ::featherweight::session_records {content} {
+    if {[catch {llength $content} count]} {
+        error "session is not a Tcl list"
+    }
+    set records {}
+    for {set index 0} {$index < $count} {incr index} {
+        set record [lindex $content $index]
+        if {[catch {dict keys $record}]} {
+            set shown [string range [list $record] 0 79]
+            error "record $index is not a record dict: $shown"
+        }
+        lappend records $record
+    }
+    return $records
+}
+
+
+# Records as the text a session file holds: one record per line where the
+# record allows it. The counterpart to session_records.
+proc ::featherweight::join_session_records {records} {
+    set text {}
+    foreach record $records {
+        append text [list $record] \n
+    }
+    return $text
+}
+
+
+# A message record: it has a role -- user, assistant, tool, or system.
+proc ::featherweight::is_message {record} {
+    if {[catch {dict keys $record}]} {
         return 0
     }
-    return 1
+    return [expr {[dict exists $record role] && [dict get $record role] ne {}}]
 }
 
 
+# A marker record: a type and no role. A fold's marker carries the summary
+# that stands in for what it cut.
+proc ::featherweight::is_marker {record} {
+    if {[catch {dict keys $record}]} {
+        return 0
+    }
+    return [expr {![dict exists $record role]
+        && [dict exists $record type] && [dict get $record type] ne {}}]
+}
+
+
+# The session's conversation: the last marker's summary followed by its
+# messages. The summary contains the system prompt and a note replacing
+# the dropped messages. A file with no markers, including one from before
+# markers existed, contains the full conversation.
+proc ::featherweight::session_messages {records} {
+    set live {}
+    foreach record $records {
+        if {[is_marker $record]} {
+            if {[dict exists $record summary]} {
+                set live [dict get $record summary]
+            } else {
+                set live {}
+            }
+            continue
+        }
+        if {![is_message $record]} {
+            set shown [string range [list $record] 0 79]
+            error "record is neither a message nor a marker: $shown"
+        }
+        lappend live $record
+    }
+    return $live
+}
+
+
+# One session as its file holds it: its last marker's summary and the
+# messages after it. A session with no file yet has no messages; a file that
+# cannot be read or understood is an error rather than an empty session, so
+# that a later save never overwrites it.
+proc ::featherweight::read_session {name} {
+    set path [session_path $name]
+    if {![file exists $path]} {
+        return {}
+    }
+    if {[catch {::fileutil::cat -encoding utf-8 $path} content options]} {
+        error "could not load [list $path]: $content" {} [dict get $options -errorinfo]
+    }
+    if {[catch {session_records $content} records]} {
+        error "session in [list $path]: $records"
+    }
+    if {[catch {session_messages $records} messages]} {
+        error "session in [list $path]: $messages"
+    }
+    return $messages
+}
+
+
+# Save a session. If its messages extend the file's conversation, append
+# the difference; otherwise, rewrite the file. The app does not normally
+# change earlier messages. A session not read by this process is left alone.
 proc ::featherweight::save_session {name} {
     variable sessions
 
@@ -460,9 +529,7 @@ proc ::featherweight::save_session {name} {
         }
     }
 
-    # A set that only adds to what the file already holds appends the
-    # difference. Only a set that changes what came before it -- never made
-    # by the app, but possible -- rewrites the file.
+    # Append an extension; rewrite only if earlier messages changed.
     if {[llength $records] >= [llength $existing]
             && [lrange $records 0 [expr {[llength $existing] - 1}]] eq $existing} {
         append_session_records $name [lrange $records [llength $existing] end]
@@ -477,9 +544,113 @@ proc ::featherweight::save_session {name} {
 }
 
 
+# Append records to a session file. The app rewrites a file only when
+# save_session receives a set that changes earlier messages.
+proc ::featherweight::append_session_records {name records} {
+    if {$records eq {}} {
+        return 1
+    }
+    set path [session_path $name]
+    file mkdir [file dirname $path]
+    if {[catch {
+        set channel [open $path a]
+        fconfigure $channel -encoding utf-8 -translation lf
+        puts -nonewline $channel [join_session_records $records]
+        close $channel
+    } error]} {
+        catch {close $channel}
+        debug_log error "could not save [list $path]: $error"
+        return 0
+    }
+    return 1
+}
+
+
+# The session's messages, read from its file the first time this process needs
+# them and kept in memory after that.
+proc ::featherweight::load_session {name} {
+    variable sessions
+
+    if {![dict exists $sessions $name]} {
+        dict set sessions $name [read_session $name]
+        # Warm the serialization cache while the interface is idle, so the
+        # first request of a session is not the one that pays for it: on the
+        # 790-message conversation that first serialization is 85ms. See
+        # memo.
+        set messages [dict get $sessions $name]
+        after idle [list ::featherweight::memo_warm $messages]
+    }
+    return [dict get $sessions $name]
+}
+
+
+proc ::featherweight::current_session_name {} {
+    variable config
+    return [dict get $config current_session]
+}
+
+
+proc ::featherweight::current_messages {} {
+    return [load_session [current_session_name]]
+}
+
+
+# Set the session's current messages. For a fold, append a marker carrying
+# the summary, followed by the retained messages. Earlier history remains
+# intact above the marker but is ignored in the live conversation.
+proc ::featherweight::set_current_messages {messages {folded {}}} {
+    variable config
+    variable sessions
+
+    set name [dict get $config current_session]
+    dict set sessions $name $messages
+
+    if {$folded eq {}} {
+        save_session $name
+        return
+    }
+
+    # The summary is what stands in for what was cut: the system prompt the
+    # fold keeps and the note that replaces the dropped messages. What
+    # follows the marker is what the conversation keeps from there on.
+    set summary [dict get $folded summary]
+    set tail [lrange $messages [llength $summary] end]
+    set marker [dict merge [dict create type fold cut [llength $summary]] $folded]
+    append_session_records $name [concat [list $marker] $tail]
+}
+
+
+# Store one message in the current session and give it a Unix time if it does
+# not have one: a user turn, an assistant reply, a tool result. Messages written
+# before timestamps existed keep none rather than being given a false one.
+# Returns the message as stored, time included, for the caller to display.
+proc ::featherweight::append_message message {
+    variable config
+    variable sessions
+
+    if {![dict exists $message time]} {
+        dict set message time [clock seconds]
+    }
+
+    set name [dict get $config current_session]
+    load_session $name
+    dict lappend sessions $name $message
+
+    append_session_records $name [list $message]
+
+    return $message
+}
+
+
 # Approximate tokens the same way Strument's RuneCounter does: Unicode code
 # points divided by four. Count the wire representation so tool arguments and
 # per-message overhead are not invisible to the context budget.
+# --- counting what a request costs ---
+#
+# A request is a budget: the model has a context window, and every message,
+# tool schema and image spends from it. These are approximate counts -- code
+# points over four -- good enough to decide what fits and what does not.
+
 proc ::featherweight::estimate_tokens {text} {
     return [expr {[string length $text] / 4}]
 }
@@ -501,6 +672,7 @@ proc ::featherweight::message_tokens message {
 }
 
 
+# Where message_tokens' count is actually worked out, before it is kept.
 proc ::featherweight::message_tokens_uncached message {
     if {[dict exists $message content] && [is_parts [dict get $message content]]} {
         set total 0
@@ -518,12 +690,15 @@ proc ::featherweight::message_tokens_uncached message {
 
 
 # What a pure function of an immutable message returned, kept so the next
-# call does not work it out again. A request serializes the conversation
-# three times -- fold_plan and prepare_request each count tokens over it,
-# which serializes every message to measure it, and json_payload serializes
-# them all again to send -- and a message does not change once appended, so
-# only the first of those passes does any work. On the 750-message
-# conversation this takes those passes from about 200ms to one.
+# call does not work it out again. memo name key body runs body in the
+# caller's scope and keeps what it returns under name and key; the next call
+# with the same name and key finds it and body does not run again. A request
+# serializes the conversation three times -- fold_plan and prepare_request
+# each count tokens over it, which serializes every message to measure it,
+# and json_payload serializes them all again to send -- and a message does
+# not change once appended, so only the first of those passes does any work.
+# On the 750-message conversation this takes those passes from about 200ms
+# to one.
 #
 # The cache is bounded twice over, by entries and by bytes, and drops the
 # least recently used fifth in one pass when it grows past either bound.
@@ -558,36 +733,12 @@ proc ::featherweight::memo {name key body} {
 }
 
 
-# What one image adds to a request.
-#
-# There is no counting an image the way there is counting text: the number is
-# the provider's, computed from dimensions by a formula each one documents
-# differently, so this is declared rather than measured. OpenAI bills a base
-# plus one charge per 512-pixel tile, which is what an OpenRouter request
-# meets; Anthropic, for comparison, documents width x height / 750. Both are
-# approximations: a provider that resizes before counting will disagree.
-# Treat the number as the right order of magnitude, which is what a context
-# guard needs, and not as a bill.
-proc ::featherweight::image_tokens {path} {
-    set dimensions [image_dimensions $path]
-    if {[llength $dimensions] != 2} {
-        # Deliberately on the high side: a guard that under-counts lets a
-        # request through that the provider then refuses, which is the
-        # failure with a cost attached.
-        return 1600
+# What every message counts as, worked out now so the next request finds it
+# in the cache. See memo.
+proc ::featherweight::memo_warm messages {
+    foreach message $messages {
+        catch {message_tokens $message}
     }
-    lassign $dimensions width height
-
-    set wide [expr {($width + 511) / 512}]
-    set tall [expr {($height + 511) / 512}]
-    set tokens [expr {85 + 170 * $wide * $tall}]
-
-    # Providers downscale very large images before counting, so the formula
-    # runs away where they do not.
-    if {$tokens > 2600} {
-        set tokens 2600
-    }
-    return $tokens
 }
 
 
@@ -656,11 +807,46 @@ proc ::featherweight::image_dimensions {path} {
 }
 
 
+# What one image adds to a request.
+#
+# There is no counting an image the way there is counting text: the number is
+# the provider's, computed from dimensions by a formula each one documents
+# differently, so this is declared rather than measured. OpenAI bills a base
+# plus one charge per 512-pixel tile, which is what an OpenRouter request
+# meets; Anthropic, for comparison, documents width x height / 750. Both are
+# approximations: a provider that resizes before counting will disagree.
+# Treat the number as the right order of magnitude, which is what a context
+# guard needs, and not as a bill.
+proc ::featherweight::image_tokens {path} {
+    set dimensions [image_dimensions $path]
+    if {[llength $dimensions] != 2} {
+        # Deliberately on the high side: a guard that under-counts lets a
+        # request through that the provider then refuses, which is the
+        # failure with a cost attached.
+        return 1600
+    }
+    lassign $dimensions width height
+
+    set wide [expr {($width + 511) / 512}]
+    set tall [expr {($height + 511) / 512}]
+    set tokens [expr {85 + 170 * $wide * $tall}]
+
+    # Providers downscale very large images before counting, so the formula
+    # runs away where they do not.
+    if {$tokens > 2600} {
+        set tokens 2600
+    }
+    return $tokens
+}
+
+
 proc ::featherweight::tools_tokens json_tools {
     return [estimate_tokens [::json::write array {*}$json_tools]]
 }
 
 
+# What the automatic fold aims at: half the context window, never less than
+# 2048 tokens.
 proc ::featherweight::history_budget {} {
     variable config
     if {![dict exists $config context_size]} {
@@ -674,6 +860,8 @@ proc ::featherweight::history_budget {} {
 }
 
 
+# /context-size's answer: what the next request costs, and what the window
+# is.
 proc ::featherweight::context_report {} {
     variable config
     variable json_tools
@@ -694,6 +882,14 @@ proc ::featherweight::context_report {} {
 }
 
 
+# --- folding history to fit ---
+#
+# A conversation outgrows its window. A fold drops the oldest turns and
+# keeps what the user said in them, quoted and summarized, and records the
+# cut in the session rather than making it.
+
+# A note from the harness itself, shown to the model as a user message: the
+# [featherweight] prefix marks it as ours rather than the person's.
 proc ::featherweight::harness_note {text} {
     return [dict create \
         role user \
@@ -703,12 +899,14 @@ proc ::featherweight::harness_note {text} {
 }
 
 
+# Whether a message is one of the harness's own notes.
 proc ::featherweight::is_harness_note message {
     return [expr {[dict get $message role] eq {user}
         && [string match {\[featherweight\]*} [content_display [dict get $message content]]]}]
 }
 
 
+# What the user said, message by message and trimmed, for a fold to quote.
 proc ::featherweight::user_texts messages {
     set texts {}
     foreach message $messages {
@@ -723,6 +921,8 @@ proc ::featherweight::user_texts messages {
 }
 
 
+# The note that stands in for the turns a fold drops: what the user said in
+# them, quoted word for word, and where the rest of them went.
 proc ::featherweight::roll_note texts {
     set text {Earlier turns of this session were dropped to keep it inside the context window. What the user said in them is quoted below, word for word, oldest first; the rest of those turns is in the session record.}
     foreach message $texts {
@@ -737,34 +937,6 @@ proc ::featherweight::roll_note texts {
 }
 
 
-# Set what the session holds now. When that is a cut of what was there, the
-# cut is recorded, not made: a marker carrying its summary is appended to the
-# file, and what the conversation keeps is appended after it. Everything
-# above the marker is merely ignored from then on. The conversation that was
-# cut away stays in the file above its marker, whole and recoverable, and
-# nothing already in the file is ever rewritten.
-proc ::featherweight::set_current_messages {messages {folded {}}} {
-    variable config
-    variable sessions
-
-    set name [dict get $config current_session]
-    dict set sessions $name $messages
-
-    if {$folded eq {}} {
-        save_session $name
-        return
-    }
-
-    # The summary is what stands in for what was cut: the system prompt the
-    # fold keeps and the note that replaces the dropped messages. What
-    # follows the marker is what the conversation keeps from there on.
-    set summary [dict get $folded summary]
-    set tail [lrange $messages [llength $summary] end]
-    set marker [dict merge [dict create type fold cut [llength $summary]] $folded]
-    append_session_records $name [concat [list $marker] $tail]
-}
-
-
 # Work out what a fold would do, without doing it. Returns a dict holding:
 #   fold       1 when a fold would happen, 0 when it would not
 #   why        why not: off, fits, no-turn, no-gain
@@ -774,8 +946,9 @@ proc ::featherweight::set_current_messages {messages {folded {}}} {
 #   said       the user texts that note would quote
 #   compacted  the messages the session would then hold
 #   target     the token count the cut is chosen against
-# Pure: it reads the session and writes nothing, so /compact, debug fold and
-# debug request can all ask the same question and get the same answer.
+# Pure, but for the note's own timestamp: it reads the session and writes
+# nothing, so /compact, debug fold and debug request can all ask the same
+# question and get the same answer.
 proc ::featherweight::fold_plan {{force 0}} {
     set messages [current_messages]
     set before [messages_tokens $messages]
@@ -837,10 +1010,8 @@ proc ::featherweight::fold_plan {{force 0}} {
     }
 
     set before_count [llength $messages]
-    # What stands in for what the fold drops is the system prompt and the
-    # note: the system prompt is kept outside the fold, so it goes in the
-    # marker's summary with the note that replaces the dropped messages. What
-    # follows the marker in the file is the kept tail.
+    # The marker's summary contains the system prompt and the note
+    # replacing the dropped messages. The retained tail follows the marker.
     set summary [list [lindex $messages 0] $note]
     set compacted [list [lindex $messages 0] $note {*}[lrange $messages $cut end]]
     set after [messages_tokens $compacted]
@@ -878,9 +1049,10 @@ proc ::featherweight::fold_decline {plan} {
 }
 
 
-# Fold the current session's history so it fits the context budget; called
-# before every request. With $force (/compact) it folds even when the history
-# already fits, and reports a fold it cannot do instead of staying quiet.
+# Fold the current session's history toward the context budget; called
+# before every request, and by /compact. A fold only happens when it leaves
+# the history smaller -- quoting the user's words is not free -- and $force
+# folds even when the history already fits, reporting a fold it cannot do.
 proc ::featherweight::compact_context {{force 0}} {
     set plan [fold_plan $force]
     if {![dict get $plan fold]} {
@@ -906,6 +1078,8 @@ proc ::featherweight::compact_context {{force 0}} {
 }
 
 
+# What the next request carries: the conversation folded to fit, or an error
+# when even that is too much for the window.
 proc ::featherweight::prepare_request {} {
     variable config
     variable json_tools
@@ -922,66 +1096,96 @@ proc ::featherweight::prepare_request {} {
 }
 
 
-# Write the configuration. Sessions are not part of it: each one is written to
-# its own file by save_session, so this file stays small however long the
-# conversations grow.
-proc ::featherweight::save_config {} {
-    variable config
+# Is this message content a list of parts -- words and images -- rather than
+# one string? The parts are dicts with a type.
+# --- the wire format ---
+#
+# What a request is made of: the tool schemas, the messages as JSON, and the
+# images as data URLs. A message carries what the API expects and nothing
+# more; what is ours -- the time a message was made, the model's reasoning --
+# is kept out here.
 
-    set path [config_path]
-    set text {}
-    dict for {key value} $config {
-        append text [list $key $value] \n
+proc ::featherweight::is_parts value {
+    if {[catch {llength $value}] || [llength $value] == 0} {
+        return 0
     }
+    set first [lindex $value 0]
+    if {[catch {dict exists $first type}]} {
+        return 0
+    }
+    return [dict exists $first type]
+}
 
-    if {[catch {write_text_file $path $text} error]} {
-        debug_log error "could not save [list $path]: $error"
+
+# The MIME type of an image, from its extension.
+proc ::featherweight::image_mime name {
+    switch -- [string tolower [file extension $name]] {
+        .jpg - .jpeg { return image/jpeg }
+        .gif { return image/gif }
+        .webp { return image/webp }
+        default { return image/png }
     }
 }
 
 
-# Store one message in the current session and give it a Unix time if it does
-# not have one: a user turn, an assistant reply, a tool result. Messages written
-# before timestamps existed keep none rather than being given a false one.
-# Returns the message as stored, time included, for the caller to display.
-proc ::featherweight::append_message message {
-    variable config
-    variable sessions
-
-    if {![dict exists $message time]} {
-        dict set message time [clock seconds]
-    }
-
-    set name [dict get $config current_session]
-    load_session $name
-    dict lappend sessions $name $message
-
-    append_session_records $name [list $message]
-
-    return $message
-}
-
-
-proc ::featherweight::get_env {name {default %UNSET%}} {
-    if {![info exists ::env($name)]} {
-        if {$default ne {%UNSET%}} {
-            return $default
+# An image part as a data URL. An empty string means the file could not be
+# read; the caller should report the missing attachment without failing
+# the request or leaving the interface waiting.
+proc ::featherweight::image_data_url part {
+    set channel {}
+    if {[catch {
+        set channel [open [dict get $part path] r]
+        fconfigure $channel -translation binary
+        set data [read $channel]
+        close $channel
+    }]} {
+        if {$channel ne {}} {
+            catch {close $channel}
         }
-
-        error "environment variable [list $name] unset"
+        return {}
     }
-
-    return $::env($name)
+    return "data:[image_mime [dict get $part name]];base64,[binary encode base64 $data]"
 }
 
 
-proc ::featherweight::api_key {} {
-    variable config
+# A message's content as the API wants it: a list of parts becomes a content
+# array where each image carries its file as a data URL. A plain string never
+# reaches here; json_message sends it as it is.
+proc ::featherweight::json_content parts {
+    set out {}
 
-    return [get_env [dict get $config api_key_env_var]]
+    foreach part $parts {
+        if {[dict get $part type] eq {image}} {
+            set url [image_data_url $part]
+            if {$url eq {}} {
+                # The file is gone -- moved on disk, or deleted by a detach
+                # before those stopped deleting. Say so rather than fail the
+                # request: the words around it still go out.
+                debug_log error "attachment is missing: [dict get $part name]"
+                lappend out [::json::write object \
+                    type [::json::write string text] \
+                    text [::json::write string "\[image unavailable: [dict get $part name]\]"] \
+                ]
+            } else {
+                lappend out [::json::write object \
+                    type [::json::write string image_url] \
+                    image_url [::json::write object \
+                        url [::json::write string $url]] \
+                ]
+            }
+        } else {
+            lappend out [::json::write object \
+                type [::json::write string text] \
+                text [::json::write string [dict get $part text]] \
+            ]
+        }
+    }
+    return [::json::write array {*}$out]
 }
 
 
+# One tool as the API wants it: the schema that tells the model what the
+# tool does and what its arguments are.
 proc ::featherweight::json_tool args {
     if {[llength $args] % 2 != 0
         || [lsort [dict keys $args]] ni {
@@ -1009,7 +1213,9 @@ proc ::featherweight::json_tool args {
             -name -
             -description -
             -required {
-                # Do nothing.
+                # -name, -description and -required were read above;
+                # -command is ours -- the model never sees which procedure
+                # runs the tool.
             }
 
             -param {
@@ -1062,6 +1268,9 @@ proc ::featherweight::json_tool args {
     ]
 }
 
+
+# One tool call as the API wants it: the name it calls and its arguments as
+# the JSON text that came in.
 proc ::featherweight::json_tool_call call {
     set function [dict get $call function]
 
@@ -1075,11 +1284,15 @@ proc ::featherweight::json_tool_call call {
     ]
 }
 
+
+# One message as JSON, kept by memo so the next request need not work it out
+# again.
 proc ::featherweight::json_message message {
     return [memo json $message {json_message_uncached $message}]
 }
 
 
+# One message as JSON, worked out once here and kept by json_message.
 proc ::featherweight::json_message_uncached message {
     set fields {}
 
@@ -1108,105 +1321,8 @@ proc ::featherweight::json_message_uncached message {
 }
 
 
-# Is this message content a list of parts -- words and images -- rather than
-# one string? The parts are dicts with a type.
-proc ::featherweight::is_parts value {
-    if {[catch {llength $value}] || [llength $value] == 0} {
-        return 0
-    }
-    set first [lindex $value 0]
-    if {[catch {dict exists $first type}]} {
-        return 0
-    }
-    return [dict exists $first type]
-}
-
-
-# A message's content as the API wants it: a string becomes one string, a list
-# of parts becomes a content array where each image carries its file as a data
-# URL.
-proc ::featherweight::json_content parts {
-    set out {}
-
-    foreach part $parts {
-        if {[dict get $part type] eq {image}} {
-            set url [image_data_url $part]
-            if {$url eq {}} {
-                # The file is gone -- moved on disk, or deleted by a detach
-                # before those stopped deleting. Say so rather than fail the
-                # request: the words around it still go out.
-                debug_log error "attachment is missing: [dict get $part name]"
-                lappend out [::json::write object \
-                    type [::json::write string text] \
-                    text [::json::write string "\[image unavailable: [dict get $part name]\]"] \
-                ]
-            } else {
-                lappend out [::json::write object \
-                    type [::json::write string image_url] \
-                    image_url [::json::write object \
-                        url [::json::write string $url]] \
-                ]
-            }
-        } else {
-            lappend out [::json::write object \
-                type [::json::write string text] \
-                text [::json::write string [dict get $part text]] \
-            ]
-        }
-    }
-    return [::json::write array {*}$out]
-}
-
-
-# An image part as a data URL. An empty string means the file could not be
-# read, which the caller has to be ready for: a missing attachment is a
-# reason to say so, never a reason to fail the request or leave the interface
-# waiting on it.
-proc ::featherweight::image_data_url part {
-    set channel {}
-    if {[catch {
-        set channel [open [dict get $part path] r]
-        fconfigure $channel -translation binary
-        set data [read $channel]
-        close $channel
-    }]} {
-        if {$channel ne {}} {
-            catch {close $channel}
-        }
-        return {}
-    }
-    return "data:[image_mime [dict get $part name]];base64,[binary encode base64 $data]"
-}
-
-
-proc ::featherweight::image_mime name {
-    switch -- [string tolower [file extension $name]] {
-        .jpg - .jpeg { return image/jpeg }
-        .gif { return image/gif }
-        .webp { return image/webp }
-        default { return image/png }
-    }
-}
-
-
-# A message's content as one piece of text: the words, and a marker for each
-# image. Used for display, for the listings, and for what a fold quotes.
-proc ::featherweight::content_display content {
-    if {![is_parts $content]} {
-        return $content
-    }
-    set lines {}
-    foreach part $content {
-        if {[dict get $part type] eq {image}} {
-            lappend lines "\[image: [dict get $part name]\]"
-        } else {
-            lappend lines [dict get $part text]
-        }
-    }
-    return [join $lines \n]
-}
-
-
+# The whole request body: the model to answer, the conversation to answer
+# about, the tools it may call.
 proc ::featherweight::json_payload {model json_tools messages} {
     set json_messages [lmap message $messages {
         ::featherweight::json_message $message
@@ -1219,6 +1335,237 @@ proc ::featherweight::json_payload {model json_tools messages} {
         tools [::json::write array {*}$json_tools] \
         tool_choice [::json::write string auto] \
     ]
+}
+
+
+# --- the tools ---
+#
+# The model's answer can name tools; the harness runs one and appends its
+# result like any other message. Each tool is a procedure taking the decoded
+# arguments and returning the text to show.
+
+proc ::featherweight::call_tool tool_call {
+    variable config
+    variable tools_available
+
+    set id [dict get $tool_call id]
+    set type [dict get $tool_call type]
+    if {$type ne {function}} {
+        return [dict create \
+            role tool \
+            tool_call_id $id \
+            content "Error: unknown tool call type: [list $type]" \
+        ]
+    }
+    set function [dict get $tool_call function]
+    set name [dict get $function name]
+    set arguments [dict get $function arguments]
+
+    if {![dict exists $tools_available $name]} {
+        return [dict create \
+            role tool \
+            tool_call_id $id \
+            content "Error: unknown tool name: [list $name]" \
+        ]
+    }
+
+    set command [dict get $tools_available $name -command]
+    if {[catch {
+        set result [{*}$command [::json::json2dict $arguments]]
+    } result]} {
+        set result "Error evaluating tool: $result"
+    }
+
+    return [dict create \
+        role tool \
+        tool_call_id $id \
+        content $result \
+    ]
+}
+
+
+# Refuse a tool call that left out something the tool requires.
+proc ::featherweight::require_tool_arguments {arguments names} {
+    foreach name $names {
+        if {![dict exists $arguments $name]} {
+            return -code error "The required \"$name\" argument was missing."
+        }
+    }
+}
+
+
+proc ::featherweight::read_text_file path {
+    set channel [open $path r]
+    if {[catch {
+        fconfigure $channel -encoding utf-8 -translation lf
+        read $channel
+    } result]} {
+        catch {close $channel}
+        return -code error $result
+    }
+    close $channel
+    return $result
+}
+
+
+# Write a file whole, through a temporary copy beside it: a crash mid-write
+# leaves the old file rather than half of the new one.
+proc ::featherweight::write_text_file {path content} {
+    file mkdir [file dirname $path]
+    set temporary "$path.[pid].[clock clicks].tmp"
+    set channel {}
+
+    if {[catch {
+        set channel [open $temporary w]
+        fconfigure $channel -encoding utf-8 -translation lf
+        puts -nonewline $channel $content
+        close $channel
+        set channel {}
+        if {$::tcl_platform(platform) ne {windows} && [file exists $path]} {
+            file attributes $temporary -permissions [file attributes $path -permissions]
+        }
+        file rename -force $temporary $path
+    } error options]} {
+        if {$channel ne {}} {
+            catch {close $channel}
+        }
+        catch {file delete -force $temporary}
+        return -options $options $error
+    }
+}
+
+
+# The read_file tool: a file's lines, numbered, from an offset.
+proc ::featherweight::tool_read_file arguments {
+    require_tool_arguments $arguments path
+    set path [dict get $arguments path]
+    if {[string trim $path] eq {}} {
+        return {The required "path" argument was missing.}
+    }
+
+    set offset 1
+    if {[dict exists $arguments offset]} {
+        set offset [dict get $arguments offset]
+    }
+    if {![string is integer -strict $offset] || $offset < 1} {
+        return {The "offset" argument must be a positive line number.}
+    }
+
+    set limit 2000
+    if {[dict exists $arguments limit]} {
+        set limit [dict get $arguments limit]
+    }
+    if {![string is integer -strict $limit] || $limit < 1} {
+        return {The "limit" argument must be a positive number of lines.}
+    }
+
+    if {[catch {read_text_file $path} content]} {
+        return "Could not read \"$path\": $content"
+    }
+
+    set content [string map {"\r\n" "\n"} $content]
+    if {$content eq {}} {
+        set lines {}
+    } else {
+        set lines [split $content \n]
+        if {[string index $content end] eq "\n"} {
+            set lines [lrange $lines 0 end-1]
+        }
+    }
+
+    set total [llength $lines]
+    set output "$path ($total lines)\n"
+    if {$offset > $total} {
+        append output "\nLine $offset is past the end of the file.\n"
+        return $output
+    }
+
+    set first [expr {$offset - 1}]
+    set last [expr {min($first + $limit - 1, $total - 1)}]
+    set width [string length [expr {$last + 1}]]
+    for {set index $first} {$index <= $last} {incr index} {
+        append output [format "%*d\u2192%s\n" $width [expr {$index + 1}] [lindex $lines $index]]
+    }
+
+    if {$last < $total - 1} {
+        set next [expr {$last + 2}]
+        append output "\n(Lines $offset-[expr {$last + 1}] of $total. Read from offset $next for more.)\n"
+    }
+    return $output
+}
+
+
+# The write_file tool: a file, in full.
+proc ::featherweight::tool_write_file arguments {
+    require_tool_arguments $arguments {path content}
+    set path [dict get $arguments path]
+    if {[string trim $path] eq {}} {
+        return {The required "path" argument was missing.}
+    }
+
+    set existed [file exists $path]
+    if {[catch {write_text_file $path [dict get $arguments content]} error]} {
+        return "Could not write \"$path\": $error"
+    }
+    return "[expr {$existed ? {Overwrote} : {Created}}] \"$path\"."
+}
+
+
+# The edit_file tool: one exact text replaced by another.
+proc ::featherweight::tool_edit_file arguments {
+    require_tool_arguments $arguments {path old_string new_string}
+    set path [dict get $arguments path]
+    if {[string trim $path] eq {}} {
+        return {The required "path" argument was missing.}
+    }
+
+    set replace_all 0
+    if {[dict exists $arguments replace_all]} {
+        set replace_all [dict get $arguments replace_all]
+        if {![string is boolean -strict $replace_all]} {
+            return {The "replace_all" argument must be a boolean.}
+        }
+    }
+    set old [dict get $arguments old_string]
+    if {$old eq {}} {
+        return {The "old_string" argument must not be empty; use write_file to replace the whole file.}
+    }
+
+    if {[catch {read_text_file $path} content]} {
+        return "Could not read \"$path\": $content"
+    }
+    set count [expr {[string length $content] - [string length [string map [list $old {}] $content]]}]
+    set count [expr {$count / [string length $old]}]
+
+    if {$count == 0} {
+        return "The search text was not found in \"$path\", so no change was made. It must match the current file contents exactly, character for character, including all whitespace, comments, and docstrings."
+    }
+    if {!$replace_all && $count != 1} {
+        return "The text to replace appears $count times in \"$path\", so it is ambiguous and nothing was changed. Include enough surrounding text to match exactly once, or use \"replace_all\": true."
+    }
+
+    set content [string map [list $old [dict get $arguments new_string]] $content]
+    if {[catch {write_text_file $path $content} error]} {
+        return "Could not write \"$path\": $error"
+    }
+    if {$replace_all} {
+        return "Replaced $count occurrence[expr {$count == 1 ? {} : {s}}] in \"$path\"."
+    }
+    return "Applied the edit to \"$path\"."
+}
+
+
+# The about tool: what this process is and where it runs.
+proc ::featherweight::tool_about arguments {
+    variable version
+    variable process_started
+    variable config
+
+    set now [clock seconds]
+    set script [file normalize [info script]]
+    set tk_version [expr {[catch {package present Tk} version] ? {unavailable} : $version}]
+    set lines [list  Featherweight  "Version: $version"  "Script: $script"  "Script modified: [clock format [file mtime $script] -format {%Y-%m-%d %H:%M:%S UTC} -gmt 1]"  "Process started: [clock format $process_started -format {%Y-%m-%d %H:%M:%S UTC} -gmt 1]"  {}  Time  "Now (UTC): [clock format $now -format {%Y-%m-%d %H:%M:%S UTC, %A} -gmt 1]"  "Now (local): [clock format $now -format {%Y-%m-%d %H:%M:%S %Z}]"  {}  System  "Tcl: [info patchlevel]"  "Tk: $tk_version"  "OS: $::tcl_platform(os)"  "OS version: $::tcl_platform(osVersion)"  "Architecture: $::tcl_platform(machine)"  "Platform: $::tcl_platform(platform)"  {}  Session  "Model: [dict get $config model]"  "Current session: [dict get $config current_session]"  "Project root: [pwd]"  ]
+    return [join $lines \n]\n
 }
 
 
@@ -1241,8 +1588,8 @@ namespace eval ::run_code {
 }
 
 
-# Run the code a tool or /eval was given. The output it prints is collected
-# here rather than sent to the process's stdout.
+# Stand in for puts while a tool's code runs: what the code prints is
+# collected for the answer rather than sent to the process's stdout.
 proc ::run_code::puts args {
     variable output
 
@@ -1291,8 +1638,9 @@ proc ::run_code::harness {script} {
 }
 
 
-# Ask for more time than the call's limit allows: 30m, 2h. Meant for a
-# computation that would otherwise be stopped when the limit runs out.
+# Ask for more time than the call's limit allows, counted from now rather
+# than from the start of the call: 30m, 2h. Meant for a computation that
+# would otherwise be stopped when the limit runs out.
 proc ::run_code::deadline {value} {
     harness [list ::featherweight::run_code_deadline [duration $value]]
 }
@@ -1355,101 +1703,11 @@ proc ::run_code::call {code main_tid token} {
 }
 
 
-# Run a command with a timeout, the way exec does but never hanging forever.
-#
-# Tcl's exec blocks the interpreter, so no timer can fire while it runs: the
-# command is run as an asynchronous pipeline instead, and a watchdog in this
-# interpreter -- which does get to run, because vwait services events -- kills
-# it when the time is up. The call still blocks until the command is done or
-# the timer goes off, so it reads like exec to the caller.
-#
-#   exec ?-timeout duration? ?-keepnewline? ?-ignorestderr? ?--? arg ...
-#
-# A duration may be 30, 30s, 2m or 1h. The default comes from exec_timeout in
-# the configuration. On timeout the command's process group is killed where
-# the platform supports it -- setsid on Unix, taskkill /T on Windows -- so
-# that the children it started go with it; without that only the command
-# itself dies and the message says so.
-proc ::run_code::exec args {
-    variable timeout
-
-    set limit $timeout
-    set ignorestderr 0
-    set keepnewline 0
-    set command {}
-    set want_timeout 0
-    set parsing 1
-    foreach arg $args {
-        if {$want_timeout} {
-            set limit [duration $arg]
-            set want_timeout 0
-            continue
-        }
-        if {$parsing} {
-            switch -- $arg {
-                -timeout {
-                    set want_timeout 1
-                    continue
-                }
-                -ignorestderr {
-                    set ignorestderr 1
-                    continue
-                }
-                -keepnewline {
-                    set keepnewline 1
-                    continue
-                }
-                -- {
-                    set parsing 0
-                    continue
-                }
-            }
-            # Like exec's own options, the first word that is not one starts
-            # the command: everything after it is a word of the command.
-            set parsing 0
-        }
-        lappend command $arg
-    }
-    if {$want_timeout} {
-        return -code error {missing value for -timeout}
-    }
-    if {![llength $command]} {
-        return -code error {wrong # args: should be "exec ?-timeout duration? ?-keepnewline? ?-ignorestderr? ?--? arg ..."}
-    }
-
-    set started [clock milliseconds]
-    set failure [run $command $ignorestderr $limit output error pid tree errcode]
-    set elapsed [expr {[clock milliseconds] - $started}]
-
-    # Like exec, the newline the command ended with is not part of the
-    # answer unless -keepnewline says otherwise.
-    if {!$keepnewline && [string match *\n $output]} {
-        set output [string range $output 0 end-1]
-    }
-
-    if {$failure eq {timeout}} {
-        return -options [dict create -code error -errorcode [list CHILDKILLED $pid SIGTERM]] \
-            [timeout_message $command $limit $tree]
-    }
-    if {$failure eq {start}} {
-        return -code error $error
-    }
-    if {$failure eq {status}} {
-        # Like exec, a command that fails raises whatever it wrote; when it
-        # wrote nothing, exec's own wording stands.
-        set message $output
-        if {$message eq {}} {
-            set message $error
-        }
-        return -options [dict create -code error -errorcode $errcode] $message
-    }
-    return $output
-}
-
-
 # Run one command and wait for it, collecting what it wrote. Returns a
-# failure name -- {}, timeout, start or status -- with the rest of the
-# details in the caller's variables.
+# failure name -- {}, timeout, start or status -- and fills the caller's
+# variables: output is what the command wrote, error why it could not run or
+# what closing the pipe said, pid the process, tree whether the processes it
+# started were killed too, and errcode how it ended.
 proc ::run_code::run {command ignorestderr limit outvar errvar pidvar treevar errcodevar} {
     upvar 1 $outvar output $errvar error $pidvar pid $treevar tree $errcodevar errcode
 
@@ -1533,11 +1791,9 @@ proc ::run_code::drain {key} {
 }
 
 
-# Signall a process and every process below it, so that the children a
-# command started go with it. On Windows taskkill walks the tree in one call;
-# elsewhere the descendants are found through ps, because a process group
-# cannot be relied on here: setsid forks at its own discretion and the pid
-# then names a process already gone.
+# Signal a process and its descendants. On Windows taskkill walks the tree;
+# elsewhere ps finds the descendants. A process group cannot be relied on:
+# setsid may fork, leaving the pid naming a process that has already exited.
 proc ::run_code::signal_tree {pid signal} {
     if {$::tcl_platform(platform) eq {windows}} {
         if {$signal eq {KILL}} {
@@ -1593,13 +1849,105 @@ proc ::run_code::descendants {pid} {
 }
 
 
+# Run a command with a timeout, the way exec does but never hanging forever.
+#
+# Tcl's exec blocks the interpreter, so no timer can fire while it runs: the
+# command is run as an asynchronous pipeline instead, and a watchdog in this
+# interpreter -- which does get to run, because vwait services events -- kills
+# it when the time is up. The call still blocks until the command is done or
+# the timer goes off, so it reads like exec to the caller.
+#
+#   exec ?-timeout duration? ?-keepnewline? ?-ignorestderr? ?--? arg ...
+#
+# A duration may be 30, 30s, 2m or 1h. The default comes from exec_timeout in
+# the configuration. On timeout the command and the processes it started are
+# signalled -- taskkill walks the tree on Windows, ps finds the descendants
+# elsewhere -- and the message says what was killed and what may be left.
+proc ::run_code::exec args {
+    variable timeout
+
+    set limit $timeout
+    set ignorestderr 0
+    set keepnewline 0
+    set command {}
+    set want_timeout 0
+    set parsing 1
+    foreach arg $args {
+        if {$want_timeout} {
+            set limit [duration $arg]
+            set want_timeout 0
+            continue
+        }
+        if {$parsing} {
+            switch -- $arg {
+                -timeout {
+                    set want_timeout 1
+                    continue
+                }
+                -ignorestderr {
+                    set ignorestderr 1
+                    continue
+                }
+                -keepnewline {
+                    set keepnewline 1
+                    continue
+                }
+                -- {
+                    set parsing 0
+                    continue
+                }
+            }
+            # Like exec's own options, the first word that is not one starts
+            # the command: everything after it is a word of the command.
+            set parsing 0
+        }
+        lappend command $arg
+    }
+    if {$want_timeout} {
+        return -code error {missing value for -timeout}
+    }
+    if {![llength $command]} {
+        return -code error {wrong # args: should be "exec ?-timeout duration? ?-keepnewline? ?-ignorestderr? ?--? arg ..."}
+    }
+
+    set started [clock milliseconds]
+    set failure [run $command $ignorestderr $limit output error pid tree errcode]
+    set elapsed [expr {[clock milliseconds] - $started}]
+
+    # Like exec, the newline the command ended with is not part of the
+    # answer unless -keepnewline says otherwise.
+    if {!$keepnewline && [string match *\n $output]} {
+        set output [string range $output 0 end-1]
+    }
+
+    if {$failure eq {timeout}} {
+        return -options [dict create -code error -errorcode [list CHILDKILLED $pid SIGTERM]] \
+            [timeout_message $command $limit $tree]
+    }
+    if {$failure eq {start}} {
+        return -code error $error
+    }
+    if {$failure eq {status}} {
+        # Like exec, a command that fails raises whatever it wrote; when it
+        # wrote nothing, exec's own wording stands.
+        set message $output
+        if {$message eq {}} {
+            set message $error
+        }
+        return -options [dict create -code error -errorcode $errcode] $message
+    }
+    return $output
+}
+
+
 # --- run_code: the code a tool call is given ---
 #
 # That code runs in a thread of its own, so that code which hangs -- a loop
 # that never ends, a command that waits forever -- takes its own thread down
 # and not the interface with it. A watchdog here in the harness stops the
 # call when its deadline passes; see run_code_expire. The thread is thrown
-# away after every call, so nothing one call does can reach the next. Without
+# away after every call, so nothing in the interpreter one call does can
+# reach the next. Without
 # the Thread package the code runs here as it always has, with only the exec
 # timeouts to bound it.
 
@@ -1706,11 +2054,10 @@ proc ::featherweight::run_code_call code {
 }
 
 
-# The watchdog behind one call. A call that runs past its deadline -- or that
-# the user stopped -- goes in steps: its child processes first, since the
-# operating system can kill those whatever the thread is doing, then the
-# thread's own evaluation, and finally the thread itself, which is dropped
-# and the call reported for what it was.
+# Stop a call that has timed out or been stopped by the user. First signal
+# its child processes, which the operating system can kill regardless of
+# what the thread is doing. Then cancel the evaluation, drop the thread,
+# and report the timeout or stop.
 proc ::featherweight::run_code_expire {token reason} {
     variable run_code_children
     variable run_code_expired
@@ -1727,6 +2074,8 @@ proc ::featherweight::run_code_expire {token reason} {
 }
 
 
+# The watchdog's second step, a second after the first: the hard signal, and
+# the thread's own evaluation cancelled under it.
 proc ::featherweight::run_code_kill token {
     variable run_code_children
     variable run_code_thread
@@ -1741,6 +2090,8 @@ proc ::featherweight::run_code_kill token {
 }
 
 
+# The watchdog's last step: the thread is dropped and the call reported for
+# what it was -- timed out, or stopped by the user.
 proc ::featherweight::run_code_abandon {token reason} {
     variable run_code_children
     variable run_code_limit
@@ -1769,6 +2120,10 @@ proc ::featherweight::run_code_abandon {token reason} {
 }
 
 
+# The run_code tool: run the model's code and answer with what it printed,
+# what it returned, and how it ended. The code runs in a thread of its own
+# where the Thread package is there -- see the run_code section above -- and
+# in the harness itself where it is not.
 proc ::featherweight::tool_run_code arguments {
     variable config
 
@@ -1780,54 +2135,6 @@ proc ::featherweight::tool_run_code arguments {
     }
 
     return [run_code_call [dict get $arguments code]]
-}
-
-
-proc ::featherweight::require_tool_arguments {arguments names} {
-    foreach name $names {
-        if {![dict exists $arguments $name]} {
-            return -code error "The required \"$name\" argument was missing."
-        }
-    }
-}
-
-
-proc ::featherweight::read_text_file path {
-    set channel [open $path r]
-    if {[catch {
-        fconfigure $channel -encoding utf-8 -translation lf
-        read $channel
-    } result]} {
-        catch {close $channel}
-        return -code error $result
-    }
-    close $channel
-    return $result
-}
-
-
-proc ::featherweight::write_text_file {path content} {
-    file mkdir [file dirname $path]
-    set temporary "$path.[pid].[clock clicks].tmp"
-    set channel {}
-
-    if {[catch {
-        set channel [open $temporary w]
-        fconfigure $channel -encoding utf-8 -translation lf
-        puts -nonewline $channel $content
-        close $channel
-        set channel {}
-        if {$::tcl_platform(platform) ne {windows} && [file exists $path]} {
-            file attributes $temporary -permissions [file attributes $path -permissions]
-        }
-        file rename -force $temporary $path
-    } error options]} {
-        if {$channel ne {}} {
-            catch {close $channel}
-        }
-        catch {file delete -force $temporary}
-        return -options $options $error
-    }
 }
 
 
@@ -1846,8 +2153,8 @@ proc ::featherweight::write_text_file {path content} {
 # the whole record in about ten milliseconds, and models write FTS5.
 
 # The record as search entries, one per message, numbered tN.M by turn: a
-# turn is what a genuine user message starts, and t4.3 is the third message
-# of the fourth. Markers contribute the summary they carry. Recall's own
+# turn is what a genuine user message starts, and t4.3 is the third entry of
+# the fourth. Markers contribute the summary they carry. Recall's own
 # tool results are left out: they are copies of the record, so a search
 # would find its own previous answers and make a fact look better attested
 # than it is.
@@ -1943,7 +2250,9 @@ proc ::featherweight::recall_entries {name} {
 
 # Whether an entry is in the scope a search asked for. Nearly all the noise
 # is in tool output -- the files the model read -- while the model's own
-# results are stated in its prose, so the two are searched apart.
+# results are stated in its prose, so the two are searched apart. A tool
+# call is what the model said, so it is conversation; only its result is
+# tools.
 proc ::featherweight::recall_in_scope {entry from} {
     if {$from eq {all}} {
         return 1
@@ -2024,11 +2333,22 @@ proc ::featherweight::recall_lines {marked context limit id} {
 }
 
 
-# One message whole, as the record holds it: at most 400 lines or 40000
-# characters, lines the query marked shown with a >.
+# One message whole, as the record holds it: about 400 lines or 40000
+# characters. marked is the message's text with the query's marks in it; the
+# lines carrying one are shown with a >.
 proc ::featherweight::recall_open {entry marked} {
     set out "[dict get $entry id] \u00b7 turn [dict get $entry turn] \u00b7 [recall_speaker $entry] \u00b7 [recall_time $entry]\n"
     set lines [split [dict get $entry text] \n]
+    # marked contains the query's marks; the display shows the text without
+    # them.
+    set marks {}
+    set markline 0
+    foreach line [split $marked \n] {
+        if {[string first \u0001 $line] >= 0} {
+            lappend marks $markline
+        }
+        incr markline
+    }
     set runes 0
     set number 0
     foreach line $lines {
@@ -2038,7 +2358,7 @@ proc ::featherweight::recall_open {entry marked} {
         }
         incr number
         set mark { }
-        if {[string first \u0001 $line] >= 0} {
+        if {[expr {$number - 1}] in $marks} {
             set mark >
         }
         append out [format "%s %d: %s\n" $mark $number \
@@ -2063,6 +2383,17 @@ proc ::featherweight::recall_time entry {
         return {}
     }
     return [format_time $time]
+}
+
+
+# Open one entry by id, whether or not it matched a search.
+proc ::featherweight::recall_open_id {entries id} {
+    foreach entry $entries {
+        if {[dict get $entry id] eq $id} {
+            return [recall_open $entry {}]
+        }
+    }
+    return "No message has the id [list $id]. Ids look like \"t4.3\" and come from a search's results."
 }
 
 
@@ -2250,378 +2581,15 @@ proc ::featherweight::tool_recall arguments {
 }
 
 
-# Open one entry by id, whether or not it matched a search.
-proc ::featherweight::recall_open_id {entries id} {
-    foreach entry $entries {
-        if {[dict get $entry id] eq $id} {
-            return [recall_open $entry {}]
-        }
-    }
-    return "No message has the id [list $id]. Ids look like \"t4.3\" and come from a search's results."
-}
+# --- one turn ---
+#
+# The loop a harness is: a request goes out, the response may name tools,
+# each tool runs and its result is appended, and the next request goes out
+# until the answer names none. Failures that another attempt can fix -- a
+# dropped connection, a server asking for patience -- are tried again.
 
-
-proc ::featherweight::tool_read_file arguments {
-    require_tool_arguments $arguments path
-    set path [dict get $arguments path]
-    if {[string trim $path] eq {}} {
-        return {The required "path" argument was missing.}
-    }
-
-    set offset 1
-    if {[dict exists $arguments offset]} {
-        set offset [dict get $arguments offset]
-    }
-    if {![string is integer -strict $offset] || $offset < 1} {
-        return {The "offset" argument must be a positive line number.}
-    }
-
-    set limit 2000
-    if {[dict exists $arguments limit]} {
-        set limit [dict get $arguments limit]
-    }
-    if {![string is integer -strict $limit] || $limit < 1} {
-        return {The "limit" argument must be a positive number of lines.}
-    }
-
-    if {[catch {read_text_file $path} content]} {
-        return "Could not read \"$path\": $content"
-    }
-
-    set content [string map {"\r\n" "\n"} $content]
-    if {$content eq {}} {
-        set lines {}
-    } else {
-        set lines [split $content \n]
-        if {[string index $content end] eq "\n"} {
-            set lines [lrange $lines 0 end-1]
-        }
-    }
-
-    set total [llength $lines]
-    set output "$path ($total lines)\n"
-    if {$offset > $total} {
-        append output "\nLine $offset is past the end of the file.\n"
-        return $output
-    }
-
-    set first [expr {$offset - 1}]
-    set last [expr {min($first + $limit - 1, $total - 1)}]
-    set width [string length [expr {$last + 1}]]
-    for {set index $first} {$index <= $last} {incr index} {
-        append output [format "%*d\u2192%s\n" $width [expr {$index + 1}] [lindex $lines $index]]
-    }
-
-    if {$last < $total - 1} {
-        set next [expr {$last + 2}]
-        append output "\n(Lines $offset-[expr {$last + 1}] of $total. Read from offset $next for more.)\n"
-    }
-    return $output
-}
-
-
-proc ::featherweight::tool_write_file arguments {
-    require_tool_arguments $arguments {path content}
-    set path [dict get $arguments path]
-    if {[string trim $path] eq {}} {
-        return {The required "path" argument was missing.}
-    }
-
-    set existed [file exists $path]
-    if {[catch {write_text_file $path [dict get $arguments content]} error]} {
-        return "Could not write \"$path\": $error"
-    }
-    return "[expr {$existed ? {Overwrote} : {Created}}] \"$path\"."
-}
-
-
-proc ::featherweight::tool_edit_file arguments {
-    require_tool_arguments $arguments {path old_string new_string}
-    set path [dict get $arguments path]
-    if {[string trim $path] eq {}} {
-        return {The required "path" argument was missing.}
-    }
-
-    set replace_all 0
-    if {[dict exists $arguments replace_all]} {
-        set replace_all [dict get $arguments replace_all]
-        if {![string is boolean -strict $replace_all]} {
-            return {The "replace_all" argument must be a boolean.}
-        }
-    }
-    set old [dict get $arguments old_string]
-    if {$old eq {}} {
-        return {The "old_string" argument must not be empty; use write_file to replace the whole file.}
-    }
-
-    if {[catch {read_text_file $path} content]} {
-        return "Could not read \"$path\": $content"
-    }
-    set count [expr {[string length $content] - [string length [string map [list $old {}] $content]]}]
-    set count [expr {$count / [string length $old]}]
-
-    if {$count == 0} {
-        return "The search text was not found in \"$path\", so no change was made. It must match the current file contents exactly, character for character, including all whitespace, comments, and docstrings."
-    }
-    if {!$replace_all && $count != 1} {
-        return "The text to replace appears $count times in \"$path\", so it is ambiguous and nothing was changed. Include enough surrounding text to match exactly once, or use \"replace_all\": true."
-    }
-
-    set content [string map [list $old [dict get $arguments new_string]] $content]
-    if {[catch {write_text_file $path $content} error]} {
-        return "Could not write \"$path\": $error"
-    }
-    if {$replace_all} {
-        return "Replaced $count occurrence[expr {$count == 1 ? {} : {s}}] in \"$path\"."
-    }
-    return "Applied the edit to \"$path\"."
-}
-
-
-proc ::featherweight::tool_about arguments {
-    variable version
-    variable process_started
-    variable config
-
-    set now [clock seconds]
-    set script [file normalize [info script]]
-    set tk_version [expr {[catch {package present Tk} version] ? {unavailable} : $version}]
-    set lines [list  Featherweight  "Version: $version"  "Script: $script"  "Script modified: [clock format [file mtime $script] -format {%Y-%m-%d %H:%M:%S UTC} -gmt 1]"  "Process started: [clock format $process_started -format {%Y-%m-%d %H:%M:%S UTC} -gmt 1]"  {}  Time  "Now (UTC): [clock format $now -format {%Y-%m-%d %H:%M:%S UTC, %A} -gmt 1]"  "Now (local): [clock format $now -format {%Y-%m-%d %H:%M:%S %Z}]"  {}  System  "Tcl: [info patchlevel]"  "Tk: $tk_version"  "OS: $::tcl_platform(os)"  "OS version: $::tcl_platform(osVersion)"  "Architecture: $::tcl_platform(machine)"  "Platform: $::tcl_platform(platform)"  {}  Session  "Model: [dict get $config model]"  "Current session: [dict get $config current_session]"  "Project root: [pwd]"  ]
-    return [join $lines \n]\n
-}
-
-proc ::featherweight::call_tool tool_call {
-    variable config
-    variable tools_available
-
-    set id [dict get $tool_call id]
-    set type [dict get $tool_call type]
-    if {$type ne {function}} {
-        return [dict create \
-            role tool \
-            tool_call_id $id \
-            content "Error: unknown tool call type: [list $type]" \
-        ]
-    }
-    set function [dict get $tool_call function]
-    set name [dict get $function name]
-    set arguments [dict get $function arguments]
-
-    if {![dict exists $tools_available $name]} {
-        return [dict create \
-            role tool \
-            tool_call_id $id \
-            content "Error: unknown tool name: [list $name]" \
-        ]
-    }
-
-    set command [dict get $tools_available $name -command]
-    if {[catch {
-        set result [{*}$command [::json::json2dict $arguments]]
-    } result]} {
-        set result "Error evaluating tool: $result"
-    }
-
-    return [dict create \
-        role tool \
-        tool_call_id $id \
-        content $result \
-    ]
-}
-
-
-
-namespace eval ::featherweight {
-    variable W {}
-    variable json_tools {}
-    variable busy 0
-    variable done 0
-
-    # How many times the current request has been sent again after a failure.
-    variable retry_count 0
-
-    # The colour of each debug category. A fold marker's underline is drawn
-    # in the colour of the tag that sets it, so the marker's own tag carries
-    # both the underline and its colour -- set the colour anywhere else and
-    # Tk draws the line in the widget's foreground instead.
-    variable debug_colors [dict create \
-        error #ff6b6b \
-        request #4fc3f7 \
-        response #a5d6a7 \
-        tool #ce93d8 \
-    ]
-
-# Collapsible debug entries: their number, and which of them are open.
-    variable debug_entry 0
-    array set debug_open {}
-
-    # Images waiting to go out with the next user message: name and stored path.
-    variable attachments {}
-    variable request_channels
-    array set request_channels {}
-
-    # One run_code call at a time: its number, its thread, its watchdog
-    # timer and deadline, the child processes it has running, and where its
-    # answer lands. See run_code_call.
-    variable run_code_serial 0
-    variable run_code_token {}
-    variable run_code_thread {}
-    variable run_code_timer {}
-    variable run_code_limit 0
-    variable run_code_children
-    array set run_code_children {}
-    variable run_code_payload
-    array set run_code_payload {}
-    variable run_code_expired
-    array set run_code_expired {}
-
-    # What immutable messages serialize to and count as, kept so a request
-    # need not work it out three times over. See memo.
-    variable memo_values
-    array set memo_values {}
-    variable memo_used
-    array set memo_used {}
-    variable memo_clock 0
-    variable memo_bytes 0
-
-    # The debug entries whose body has not been built yet: a request or a
-    # tool result can be a megabyte and is folded shut anyway. See
-    # debug_toggle.
-    variable debug_text
-    array set debug_text {}
-
-    # The folded reasoning blocks in the conversation: their number, and
-    # which of them are open. See ui_thinking.
-    variable thinking_serial 0
-    variable thinking_open
-    array set thinking_open {}
-}
-
-
-proc ::featherweight::pretty {raw} {
-    if {[auto_execok jq] ne {}} {
-        if {![catch {exec jq . << $raw} out]} {
-            return $out
-        }
-    }
-    return $raw
-}
-
-
-
-proc ::featherweight::debug_log {category text {label {}}} {
-    variable config
-    variable W
-    variable debug_entry
-    variable debug_open
-    variable debug_text
-    if {![dict get $config debug] && $category ni {error}} { return }
-    set ts [format_time [clock seconds]]
-    if {[dict exists $W debug]} {
-        set w [dict get $W debug]
-        $w configure -state normal
-        if {$category in {request response} || $label ne {}} {
-            # Something long: show the header and fold the body away the way
-            # an HTML details element does. The label names the entry -- the
-            # tool a call is for -- so the log stays navigable without
-            # clicking. The marker opens it again.
-            #
-            # The body is not built here: a request or a tool result can be
-            # a megabyte, formatting it with jq costs real time, and the
-            # entry is folded shut anyway. What the entry holds is kept in
-            # debug_text, and debug_toggle builds it the first time the
-            # marker opens it. One empty line carries the body's tag so the
-            # entry has a body to open even before there is text to show.
-            incr debug_entry
-            set n $debug_entry
-            set debug_open($n) 0
-            set debug_text($n) $text
-            set head "$ts ($category)"
-            if {$label ne {}} {
-                append head " $label"
-            }
-            $w insert end "$head " [list cat_$category]
-            $w insert end {[+]} [list cat_$category toggle$n]
-            $w insert end "\n" [list cat_$category]
-            $w insert end "\n" [list cat_$category body$n]
-            $w tag configure body$n -elide 1
-            # Tk draws an underline in the colour of the tag that sets it, so
-            # the marker's own tag carries the underline and its colour.
-            set color [debug_color $category]
-            if {$color eq {}} {
-                $w tag configure toggle$n -underline 1
-            } else {
-                $w tag configure toggle$n -underline 1 -underlinefg $color
-            }
-            $w tag bind toggle$n <Button-1> [list [namespace current]::debug_toggle $w $n]
-        } else {
-            $w insert end "$ts ($category) $text\n" [list "cat_$category"]
-        }
-        $w configure -state disabled
-        $w see end
-        return
-    }
-    if {[catch {
-        set fh [open [file join [pwd] featherweight-debug.log] a]
-        ::puts $fh "$ts ($category) $text"
-        close $fh
-    }]} {}
-}
-
-
-# The colour of one debug category, or {} for one that has none.
-proc ::featherweight::debug_color {category} {
-    variable debug_colors
-
-    if {[dict exists $debug_colors $category]} {
-        return [dict get $debug_colors $category]
-    }
-    return {}
-}
-
-
-# Open or close one folded debug entry. The marker is three characters wide
-# either way, so nothing below it moves when it is clicked.
-proc ::featherweight::debug_toggle {w n} {
-    variable debug_open
-    variable debug_text
-
-    set open 0
-    if {[info exists debug_open($n)]} {
-        set open $debug_open($n)
-    }
-    $w configure -state normal
-    if {$open} {
-        $w tag configure body$n -elide 1
-        set marker {[+]}
-    } else {
-        if {[info exists debug_text($n)]} {
-            # The body was never built. It can be a megabyte and formatting
-            # it for display costs real time, so it is built the first time
-            # anyone asks for it: the entry's one empty line held its place.
-            set ranges [$w tag ranges body$n]
-            if {[llength $ranges] >= 2} {
-                lassign $ranges start end
-                $w insert $start [pretty $debug_text($n)] [$w tag names $start]
-            }
-            unset debug_text($n)
-        }
-        $w tag configure body$n -elide 0
-        set marker {[-]}
-    }
-    set ranges [$w tag ranges toggle$n]
-    if {[llength $ranges] >= 2} {
-        lassign $ranges start end
-        set tags [$w tag names $start]
-        $w delete $start $end
-        $w insert $start $marker $tags
-        $w see $start
-    }
-    set debug_open($n) [expr {!$open}]
-    $w configure -state disabled
-}
-
-
+# The answer as we store it: its content, its tool calls, and its reasoning
+# for the record -- the reasoning is never sent back.
 proc ::featherweight::clean_assistant_message {msg} {
     set out [dict create role assistant]
     if {[dict exists $msg content]} {
@@ -2707,9 +2675,217 @@ proc ::featherweight::apply_message {cleaned} {
 }
 
 
+# What went wrong with a curl run, from the trailing --write-out line if it is
+# there, or from the error close reported. That line holds the HTTP status,
+# curl's exit code and curl's own message, and it survives a run that failed --
+# so the reason is named rather than guessed.
+proc ::featherweight::curl_error {output close_error} {
+    set marker [string last "\n" $output]
+    if {$marker >= 0} {
+        set metadata [string range $output [expr {$marker + 1}] end]
+        set error_msg [lassign $metadata status exit_code]
+        if {[string is integer -strict $exit_code] && $exit_code != 0} {
+            return "curl ($exit_code): $error_msg"
+        }
+    }
+    return "curl request failed: $close_error"
+}
+
+
+# Retry after a pause until the configured retry limit is reached. Only
+# potentially recoverable failures come here: curl could not connect,
+# timed out, or lost its connection; or the server returned 429 or 5xx.
+# The pause grows 1, 2, 4, 8, 16 seconds.
+proc ::featherweight::retry_request {why} {
+    variable busy
+    variable config
+    variable retry_count
+
+    incr retry_count
+    set retries 5
+    if {[dict exists $config retries]} {
+        set retries [dict get $config retries]
+    }
+    if {$retry_count > $retries} {
+        debug_log error "giving up after $retries retries: $why"
+        set retry_count 0
+        set_ui_busy 0
+        return
+    }
+
+    set delay [expr {1 << ($retry_count - 1)}]
+    if {$delay > 16} {
+        set delay 16
+    }
+    debug_log error "retry $retry_count of $retries in $delay s: $why"
+    after [expr {$delay * 1000}] [list [namespace current]::retry_pending]
+}
+
+
+# One scheduled retry. The turn may have been stopped while it waited.
+proc ::featherweight::retry_pending {} {
+    variable busy
+    if {!$busy} { return }
+    request_async
+}
+
+
+# Send the request. Everything that builds it is inside the catch: an error
+# here stops the turn with a reason, never a silent wait. The response
+# arrives at request_readable.
+proc ::featherweight::request_async {} {
+    variable busy
+    variable config
+    variable curl_data
+    variable json_tools
+    variable request_channels
+
+    if {!$busy} { return }
+    # Everything that builds the request is inside this catch. An error that
+    # escaped it is what left the interface saying "Working..." forever, with
+    # Tk's dialog up behind it and nothing in the log but the traceback.
+    if {[catch {
+        set messages [prepare_request]
+        set payload [json_payload [dict get $config model] $json_tools $messages]
+    } error]} {
+        debug_log error $error
+        set_ui_busy 0
+        return
+    }
+    debug_log request $payload
+
+    if {[catch {
+        set ch [open |[list curl \
+            --data-binary @- << $payload \
+            --header "Authorization: Bearer [api_key]" \
+            --header {Content-Type: application/json} \
+            --header {X-OpenRouter-Title: Featherweight} \
+            --referer https://dbohdan.com/featherweight \
+            --request POST \
+            --show-error \
+            --silent \
+            --max-time [dict get $config timeout] \
+            --write-out "\n%{http_code} %{exitcode} %{errormsg}" \
+            [dict get $config endpoint] \
+        ]]
+    } error]} {
+        debug_log error "could not start curl request: $error"
+        set_ui_busy 0
+        return
+    }
+
+    set curl_data($ch) {}
+    set request_channels($ch) 1
+    fconfigure $ch -blocking 0
+    fileevent $ch readable [list [namespace current]::request_readable $ch]
+}
+
+
+# The response arriving a piece at a time; at its end, the reply is stored
+# and the turn continues.
+proc ::featherweight::request_readable ch {
+    variable busy
+    variable curl_data
+    variable request_channels
+    variable retry_count
+
+    if {!$busy || ![info exists request_channels($ch)]} { return }
+
+    # Accumulate available output. Wait for EOF before parsing the response.
+    if {[catch {read $ch} chunk]} {
+        fileevent $ch readable {}
+        unset -nocomplain curl_data($ch)
+        unset request_channels($ch)
+        catch {close $ch}
+        retry_request "could not read curl response: $chunk"
+        return
+    }
+    append curl_data($ch) $chunk
+    if {![eof $ch]} {
+        return
+    }
+
+    fileevent $ch readable {}
+    set output $curl_data($ch)
+    unset curl_data($ch)
+    unset request_channels($ch)
+
+    if {[catch {close $ch} error]} {
+        if {!$busy} { return }
+        retry_request [curl_error $output $error]
+        return
+    }
+    if {!$busy} { return }
+
+    # Separate the status appended by --write-out from the response body.
+    set marker [string last "\n" $output]
+    if {$marker < 0} {
+        debug_log error {curl response did not include an HTTP status}
+        set_ui_busy 0
+        return
+    }
+
+    set metadata [string range $output [expr {$marker + 1}] end]
+    set error_msg [lassign $metadata status exit_code]
+
+    if {![string is integer -strict $status]} {
+        debug_log error "invalid HTTP status from curl: $status"
+        set_ui_busy 0
+        return
+    }
+
+    if {![string is integer -strict $exit_code]} {
+        debug_log error "invalid exit code from curl: $exit_code"
+        set_ui_busy 0
+        return
+    }
+
+    if {$exit_code != 0} {
+        retry_request "curl ($exit_code): $error_msg"
+        return
+    }
+    set retry_count 0
+
+    set data [string range $output 0 [expr {$marker - 1}]]
+
+    debug_log response "HTTP $status\n$data"
+
+    if {$status != 200} {
+        # 429 and 5xx are the server asking for patience; anything else is
+        # the request being wrong and a retry would fail the same way.
+        if {$status == 429 || $status >= 500} {
+            retry_request "HTTP $status: $data"
+            return
+        }
+        debug_log error "HTTP $status: $data"
+        set_ui_busy 0
+        return
+    }
+
+    if {[catch {response_message $data} cleaned]} {
+        debug_log error $cleaned
+        set_ui_busy 0
+        return
+    }
+
+    if {[apply_message $cleaned]} {
+        request_async
+        return
+    }
+
+    set_ui_busy 0
+}
+
+
 # A Unix time as text, in the configured format. Messages store Unix time;
 # this is what turns it into a line for the interface, the debug log, and the
 # session listings.
+# --- showing the conversation ---
+#
+# Every message is a heading -- its time, then its label in bold -- and a
+# body: the words in the color of whoever said them, a tool call as its
+# name and its parameters, the model's reasoning folded shut.
+
 proc ::featherweight::format_time {time} {
     variable config
 
@@ -2742,6 +2918,25 @@ proc ::featherweight::message_reasoning message {
 }
 
 
+# A message's content as one piece of text: the words, and a marker for each
+# image. Used for display, for the listings, and for what a fold quotes.
+proc ::featherweight::content_display content {
+    if {![is_parts $content]} {
+        return $content
+    }
+    set lines {}
+    foreach part $content {
+        if {[dict get $part type] eq {image}} {
+            lappend lines "\[image: [dict get $part name]\]"
+        } else {
+            lappend lines [dict get $part text]
+        }
+    }
+    return [join $lines \n]
+}
+
+
+# Put text in the conversation, in the style of one of its tags.
 proc ::featherweight::ui_append {tag text} {
     variable W
     if {![dict exists $W chat]} { return }
@@ -2754,9 +2949,8 @@ proc ::featherweight::ui_append {tag text} {
 
 
 # The heading of a message: the time on its own line, then the label in
-# bold, then the text. The date leads because it is context and the label is
-# the anchor of the block; on one line the label's length set the date's
-# indent and long headings pushed it far to the right.
+# bold. The two on one line would fight for it: a long label like Tool call:
+# edit_file pushed the time far to the right.
 proc ::featherweight::ui_label {label time} {
     if {$time eq {}} {
         ui_append role "$label\n"
@@ -2798,10 +2992,10 @@ proc ::featherweight::tool_arguments_text {name raw} {
         }
     }
 
-    # The arguments as they were written: a name's value is what follows it
-    # up to the next name, which distinguishes a JSON array from a string
-    # that merely looks like a list. (No names here: this file is built with
-    # subst, which would replace them.)
+    # The arguments as they were written: an array is recognized from the
+    # raw text rather than the decoded value's shape, because a string with
+    # spaces or newlines looks like a list and is not one. The pattern below
+    # avoids a bare close brace, which would end this procedure body.
     set raw_values {}
     set arguments {}
     if {[catch {json::json2dict $raw} value]} {
@@ -2811,10 +3005,6 @@ proc ::featherweight::tool_arguments_text {name raw} {
     if {$arguments eq {}} {
         return $raw
     }
-    # A name's value is what follows it up to the next name: an array is
-    # recognized here rather than by the value's shape, because a string
-    # with spaces or newlines looks like a list and is not one. The pattern
-    # avoids a bare close brace, which would end this procedure body.
     set raw_values {}
     foreach line [split $raw \n] {
         foreach {full key value} \
@@ -2870,6 +3060,8 @@ proc ::featherweight::tool_arguments_text {name raw} {
 }
 
 
+# One tool call in the conversation: run_code shows its code, any other tool
+# shows its name and its parameters.
 proc ::featherweight::ui_tool_code {call {time {}}} {
     set function [dict get $call function]
     set name [dict get $function name]
@@ -2894,11 +3086,9 @@ proc ::featherweight::ui_tool {text {time {}}} {
 }
 
 
-# The model's own reasoning, shown folded: it is the work rather than the
-# answer, and the answer should not have to share the line with it. The
-# marker opens it the way the debug log's entries do. The date leads the
-# message here, so the blocks after it are one message and take their labels
-# without repeating it.
+# Show the model's reasoning folded, separate from the answer. The marker
+# opens it like a debug-log entry. The date precedes the reasoning; later
+# blocks of the same message have labels but do not repeat the date.
 proc ::featherweight::ui_thinking {text {time {}}} {
     variable W
     variable thinking_open
@@ -2920,8 +3110,8 @@ proc ::featherweight::ui_thinking {text {time {}}} {
     if {![dict exists $W chat]} { return }
     set w [dict get $W chat]
     $w tag configure body$n -elide 1
-    # The marker's own tag carries its colour as well as the underline: Tk
-    # draws an underline in the colour of the tag that sets it.
+    # The marker's own tag carries its color as well as the underline: Tk
+    # draws an underline in the color of the tag that sets it.
     $w tag configure think$n -foreground #555555 -underline 1
     $w tag bind think$n <Button-1> [list [namespace current]::ui_thinking_toggle $n]
 }
@@ -2956,6 +3146,8 @@ proc ::featherweight::ui_thinking_toggle n {
 }
 
 
+# Draw the conversation from the session: every message in order, each tool
+# call under the message that made it.
 proc ::featherweight::replay_messages {} {
     variable config
 
@@ -2999,22 +3191,146 @@ proc ::featherweight::replay_messages {} {
 }
 
 
-# What the images staged by /attach would add to the next request. They are
-# not in any message until that message is sent, so a count that walks the
-# conversation misses them -- and the moment the number is wanted is exactly
-# while they are staged and still being decided on.
-proc ::featherweight::attachments_tokens {} {
-    variable attachments
+# --- the debug log ---
+#
+# What the harness did, in its own pane beneath the conversation: every
+# request and response, every tool call and result. Long entries fold to
+# their header and build their body the first time the marker opens them.
 
-    set total 0
-    foreach attachment $attachments {
-        incr total [image_tokens [dict get $attachment path]]
+# JSON as it is read rather than as it is sent: jq formats it when jq is
+# there, and it is shown as it came when it is not.
+proc ::featherweight::pretty {raw} {
+    if {[auto_execok jq] ne {}} {
+        if {![catch {exec jq . << $raw} out]} {
+            return $out
+        }
     }
-    return $total
+    return $raw
+}
+
+
+# One entry in the debug log: what the harness did, to the pane when there
+# is one and to a file when there is not. Long entries fold to their header.
+proc ::featherweight::debug_log {category text {label {}}} {
+    variable config
+    variable W
+    variable debug_entry
+    variable debug_open
+    variable debug_text
+    if {![dict get $config debug] && $category ni {error}} { return }
+    set ts [format_time [clock seconds]]
+    if {[dict exists $W debug]} {
+        set w [dict get $W debug]
+        $w configure -state normal
+        if {$category in {request response} || $label ne {}} {
+            # Something long: show the header and fold the body away the way
+            # an HTML details element does. The label names the entry -- the
+            # tool a call is for -- so the log stays navigable without
+            # clicking. The marker opens it again.
+            #
+            # The body is not built here: a request or a tool result can be
+            # a megabyte, formatting it with jq costs real time, and the
+            # entry is folded shut anyway. What the entry holds is kept in
+            # debug_text, and debug_toggle builds it the first time the
+            # marker opens it. One empty line carries the body's tag so the
+            # entry has a body to open even before there is text to show.
+            incr debug_entry
+            set n $debug_entry
+            set debug_open($n) 0
+            set debug_text($n) $text
+            set head "$ts ($category)"
+            if {$label ne {}} {
+                append head " $label"
+            }
+            $w insert end "$head " [list cat_$category]
+            $w insert end {[+]} [list cat_$category toggle$n]
+            $w insert end "\n" [list cat_$category]
+            $w insert end "\n" [list cat_$category body$n]
+            $w tag configure body$n -elide 1
+            # Tk draws an underline in the color of the tag that sets it, so
+            # the marker's own tag carries the underline and its color.
+            set color [debug_color $category]
+            if {$color eq {}} {
+                $w tag configure toggle$n -underline 1
+            } else {
+                $w tag configure toggle$n -underline 1 -underlinefg $color
+            }
+            $w tag bind toggle$n <Button-1> [list [namespace current]::debug_toggle $w $n]
+        } else {
+            $w insert end "$ts ($category) $text\n" [list "cat_$category"]
+        }
+        $w configure -state disabled
+        $w see end
+        return
+    }
+    if {[catch {
+        set fh [open [file join [pwd] featherweight-debug.log] a]
+        ::puts $fh "$ts ($category) $text"
+        close $fh
+    }]} {}
+}
+
+
+# The color of one debug category, or {} for one that has none.
+proc ::featherweight::debug_color {category} {
+    variable debug_colors
+
+    if {[dict exists $debug_colors $category]} {
+        return [dict get $debug_colors $category]
+    }
+    return {}
+}
+
+
+# Open or close one folded debug entry. The marker is three characters wide
+# either way, so nothing below it moves when it is clicked.
+proc ::featherweight::debug_toggle {w n} {
+    variable debug_open
+    variable debug_text
+
+    set open 0
+    if {[info exists debug_open($n)]} {
+        set open $debug_open($n)
+    }
+    $w configure -state normal
+    if {$open} {
+        $w tag configure body$n -elide 1
+        set marker {[+]}
+    } else {
+        if {[info exists debug_text($n)]} {
+            # The body was never built. It can be a megabyte and formatting
+            # it for display costs real time, so it is built the first time
+            # anyone asks for it: the entry's one empty line held its place.
+            set ranges [$w tag ranges body$n]
+            if {[llength $ranges] >= 2} {
+                lassign $ranges start end
+                $w insert $start [pretty $debug_text($n)] [$w tag names $start]
+            }
+            unset debug_text($n)
+        }
+        $w tag configure body$n -elide 0
+        set marker {[-]}
+    }
+    set ranges [$w tag ranges toggle$n]
+    if {[llength $ranges] >= 2} {
+        lassign $ranges start end
+        set tags [$w tag names $start]
+        $w delete $start $end
+        $w insert $start $marker $tags
+        $w see $start
+    }
+    set debug_open($n) [expr {!$open}]
+    $w configure -state disabled
 }
 
 
 # What a file contains, in hex, which is what its stored copy is named after.
+# --- the window and its commands ---
+#
+# The interface as its user sees it: the input and its Send button, the
+# status line and what waits on it, images attached to the next message, and
+# the slash commands that change the state between messages.
+
 proc ::featherweight::attachment_digest {path} {
     return [::sha2::sha256 -hex -filename $path]
 }
@@ -3024,6 +3340,19 @@ proc ::featherweight::attachment_digest {path} {
 # original being moved or deleted.
 proc ::featherweight::attachments_dir {} {
     return [file join [state_dir] attachments]
+}
+
+
+# What the images staged by /attach would add to the next request. A count
+# of the conversation misses them until they are sent.
+proc ::featherweight::attachments_tokens {} {
+    variable attachments
+
+    set total 0
+    foreach attachment $attachments {
+        incr total [image_tokens [dict get $attachment path]]
+    }
+    return $total
 }
 
 
@@ -3111,6 +3440,8 @@ proc ::featherweight::update_status_bar {} {
 }
 
 
+# The button and the status line say whether a turn is running: Send becomes
+# Stop while one is.
 proc ::featherweight::set_ui_busy {flag} {
     variable W
     variable busy
@@ -3127,6 +3458,8 @@ proc ::featherweight::set_ui_busy {flag} {
 }
 
 
+# Stop the turn in progress: the request being sent or retried, the tool
+# call running, all of it.
 proc ::featherweight::stop {} {
     variable busy
     variable curl_data
@@ -3156,8 +3489,6 @@ proc ::featherweight::stop {} {
 }
 
 
-
-
 proc ::featherweight::submit_or_stop {} {
     variable busy
     if {$busy} {
@@ -3168,6 +3499,7 @@ proc ::featherweight::submit_or_stop {} {
 }
 
 
+# Send what is in the input as the next user message, and start the turn.
 proc ::featherweight::submit {} {
     variable W
     variable busy
@@ -3214,6 +3546,8 @@ proc ::featherweight::update_window_title {} {
 }
 
 
+# Redraw the conversation from the session: after a fold, or after switching
+# to another one.
 proc ::featherweight::refresh_session {} {
     variable W
     if {![dict exists $W chat]} { return }
@@ -3226,6 +3560,7 @@ proc ::featherweight::refresh_session {} {
 }
 
 
+# Make another session the current one: load it, show it, save the choice.
 proc ::featherweight::switch_session name {
     variable config
     variable sessions
@@ -3253,6 +3588,7 @@ proc ::featherweight::switch_session name {
 }
 
 
+# Run a /command typed in the input, and say whether the text was one.
 proc ::featherweight::handle_slash_command text {
     variable config
     variable W
@@ -3370,212 +3706,12 @@ proc ::featherweight::handle_slash_command text {
 }
 
 
-# What went wrong with a curl run, from the trailing --write-out line if it is
-# there, or from the error close reported. That line holds the HTTP status,
-# curl's exit code and curl's own message, and it survives a run that failed --
-# so the reason is named rather than guessed.
-proc ::featherweight::curl_error {output close_error} {
-    set marker [string last "\n" $output]
-    if {$marker >= 0} {
-        set metadata [string range $output [expr {$marker + 1}] end]
-        set error_msg [lassign $metadata status exit_code]
-        if {[string is integer -strict $exit_code] && $exit_code != 0} {
-            return "curl ($exit_code): $error_msg"
-        }
-    }
-    return "curl request failed: $close_error"
-}
-
-
-# Send the same request again after a pause, or give up once the configured
-# number of retries is spent. Only failures where the request never got
-# through come here -- a curl that could not connect, timed out, or had its
-# connection dropped, or a server answering 429 or 5xx -- since those are the
-# ones another attempt can fix. The pause grows 1, 2, 4, 8, 16 seconds.
-proc ::featherweight::retry_request {why} {
-    variable busy
-    variable config
-    variable retry_count
-
-    incr retry_count
-    set retries 5
-    if {[dict exists $config retries]} {
-        set retries [dict get $config retries]
-    }
-    if {$retry_count > $retries} {
-        debug_log error "giving up after $retries retries: $why"
-        set retry_count 0
-        set_ui_busy 0
-        return
-    }
-
-    set delay [expr {1 << ($retry_count - 1)}]
-    if {$delay > 16} {
-        set delay 16
-    }
-    debug_log error "retry $retry_count of $retries in $delay s: $why"
-    after [expr {$delay * 1000}] [list [namespace current]::retry_pending]
-}
-
-
-# One scheduled retry. The turn may have been stopped while it waited.
-proc ::featherweight::retry_pending {} {
-    variable busy
-    if {!$busy} { return }
-    request_async
-}
-
-
-proc ::featherweight::request_async {} {
-    variable busy
-    variable config
-    variable curl_data
-    variable json_tools
-    variable request_channels
-
-    if {!$busy} { return }
-    # Everything that builds the request is inside this catch. An error that
-    # escaped it is what left the interface saying "Working..." forever, with
-    # Tk's dialog up behind it and nothing in the log but the traceback.
-    if {[catch {
-        set messages [prepare_request]
-        set payload [json_payload [dict get $config model] $json_tools $messages]
-    } error]} {
-        debug_log error $error
-        set_ui_busy 0
-        return
-    }
-    debug_log request $payload
-
-    if {[catch {
-        set ch [open |[list curl \
-            --data-binary @- << $payload \
-            --header "Authorization: Bearer [api_key]" \
-            --header {Content-Type: application/json} \
-            --header {X-OpenRouter-Title: Featherweight} \
-            --referer https://dbohdan.com/featherweight \
-            --request POST \
-            --show-error \
-            --silent \
-            --max-time [dict get $config timeout] \
-            --write-out "\n%{http_code} %{exitcode} %{errormsg}" \
-            [dict get $config endpoint] \
-        ]]
-    } error]} {
-        debug_log error "could not start curl request: $error"
-        set_ui_busy 0
-        return
-    }
-
-    set curl_data($ch) {}
-    set request_channels($ch) 1
-    fconfigure $ch -blocking 0
-    fileevent $ch readable [list [namespace current]::request_readable $ch]
-}
-
-
-proc ::featherweight::request_readable ch {
-    variable busy
-    variable curl_data
-    variable request_channels
-    variable retry_count
-
-    if {!$busy || ![info exists request_channels($ch)]} { return }
-
-    # Accumulate available output. Wait for EOF before parsing the response.
-    if {[catch {read $ch} chunk]} {
-        fileevent $ch readable {}
-        unset -nocomplain curl_data($ch)
-        unset request_channels($ch)
-        catch {close $ch}
-        retry_request "could not read curl response: $chunk"
-        return
-    }
-    append curl_data($ch) $chunk
-    if {![eof $ch]} {
-        return
-    }
-
-    fileevent $ch readable {}
-    set output $curl_data($ch)
-    unset curl_data($ch)
-    unset request_channels($ch)
-
-    if {[catch {close $ch} error]} {
-        if {!$busy} { return }
-        retry_request [curl_error $output $error]
-        return
-    }
-    if {!$busy} { return }
-
-    # Separate the status appended by --write-out from the response body.
-    set marker [string last "\n" $output]
-    if {$marker < 0} {
-        debug_log error {curl response did not include an HTTP status}
-        set_ui_busy 0
-        return
-    }
-
-    set metadata [string range $output [expr {$marker + 1}] end]
-    set error_msg [lassign $metadata status exit_code]
-
-    if {![string is integer -strict $status]} {
-        debug_log error "invalid HTTP status from curl: $status"
-        set_ui_busy 0
-        return
-    }
-
-    if {![string is integer -strict $exit_code]} {
-        debug_log error "invalid exit code from curl: $exit_code"
-        set_ui_busy 0
-        return
-    }
-
-    if {$exit_code != 0} {
-        retry_request "curl ($exit_code): $error_msg"
-        return
-    }
-    set retry_count 0
-
-    set data [string range $output 0 [expr {$marker - 1}]]
-
-    debug_log response "HTTP $status\n$data"
-
-    if {$status != 200} {
-        # 429 and 5xx are the server asking for patience; anything else is
-        # the request being wrong and a retry would fail the same way.
-        if {$status == 429 || $status >= 500} {
-            retry_request "HTTP $status: $data"
-            return
-        }
-        debug_log error "HTTP $status: $data"
-        set_ui_busy 0
-        return
-    }
-
-    if {[catch {response_message $data} cleaned]} {
-        debug_log error $cleaned
-        set_ui_busy 0
-        return
-    }
-
-    if {[apply_message $cleaned]} {
-        request_async
-        return
-    }
-
-    set_ui_busy 0
-}
-
-
 proc ::featherweight::on_close {} {
     variable busy
     variable done
     if {$busy} { stop }
     set done 1
 }
-
-
 
 
 proc ::featherweight::text_has_selection {w} {
@@ -3651,6 +3787,8 @@ proc ::featherweight::show_text_context_menu {w x y editable} {
 }
 
 
+# Give a text widget its right-click menu: cut and paste where the widget is
+# editable, copy and select everywhere.
 proc ::featherweight::install_text_context_menu {w {editable 0}} {
     set command [list [namespace current]::show_text_context_menu $w %x %y $editable]
     bind $w <Button-3> $command
@@ -3658,6 +3796,8 @@ proc ::featherweight::install_text_context_menu {w {editable 0}} {
 }
 
 
+# The window: the conversation, the debug log beneath it, and the input with
+# its Send button. Everything the interface can do is bound here.
 proc ::featherweight::build_ui {} {
     variable W
     variable config
@@ -3701,12 +3841,11 @@ proc ::featherweight::build_ui {} {
     grid columnconfigure .root.pane.dbgf.body 0 -weight 1
     .root.pane add .root.pane.dbgf -weight 2
 
-    # The input is the third pane of the same panedwindow as Conversation and
-    # Debug, so the sash above it sets its height; the padding keeps it clear
-    # of that sash. Inside it the text and the Send button are two panes of a
-    # horizontal panedwindow, so a sash sits between them just as one sits
-    # between Conversation and Debug. -weight 1 on the text makes it the pane
-    # that window resizes feed; the button stays at its requested width.
+    # The input is the third pane below Conversation and Debug; the sash
+    # above it sets its height, and padding keeps it clear of the sash.
+    # Inside it, a horizontal panedwindow separates the text and Send button.
+    # Weight 1 gives the text pane the space from window resizes; the button
+    # stays at its requested width.
     ttk::frame .root.input -padding {0 6 0 0}
     ttk::panedwindow .root.input.p -orient horizontal
     text .root.input.p.e -wrap word -height 4 -width 40 -undo 1
@@ -3735,14 +3874,14 @@ proc ::featherweight::build_ui {} {
     set chat [dict get $W chat]
     font create ::featherweight::role_font  {*}[font configure TkTextFont]  -weight bold
     $chat tag configure role -font ::featherweight::role_font -foreground #555555
-    # Timestamps sit beside the label at the size of the message text: it is
-    # the label's weight that sets the two apart, so the time stays legible.
+    # The time above each label is the size of the message text: it is the
+    # label's weight that sets the two apart, so the time stays legible.
     $chat tag configure timestamp -font TkTextFont -foreground #555555
     $chat tag configure user -foreground #0b57d0
     $chat tag configure assistant -foreground #1b5e20
     $chat tag configure tool -foreground #6a1b9a
-    # The model's reasoning is its work rather than its answer: shown in a
-    # quieter colour, and folded shut to begin with.
+    # The model's reasoning is its work rather than its answer: shown faded out
+    # and folded closed to begin with.
     $chat tag configure thinking -foreground #8a8a8a
     $chat configure -state disabled
 
@@ -3759,7 +3898,11 @@ proc ::featherweight::build_ui {} {
 }
 
 
-
+# --- script mode ---
+#
+# The same state without a window: what a request would be, what a fold
+# would cut, what the sessions hold. Nothing here sends a request; the
+# replay runs one turn from recorded responses against a copied state.
 
 proc ::featherweight::usage {} {
     return {Usage: tclsh featherweight.tcl [debug <subcommand> [options]]
@@ -3787,8 +3930,7 @@ only debug eval can change what is stored:
       file and the configuration. check exits non-zero on a problem.
   debug eval <tcl-code>
       Evaluate Tcl as the run_code tool would and print what it printed
-      and what it returned, in the harness's own thread. Unlike a tool
-      call it keeps its state from one time to the next. This one can
+      and what it returned, in the harness's own thread. This one can
       change state.
   debug selftest
       Run the scripts in tests/. Exits non-zero if any of them fails.}
@@ -3823,7 +3965,9 @@ proc ::featherweight::message_summary {message} {
 }
 
 
-# Script mode: tclsh featherweight.tcl debug <subcommand> ...
+# Script mode: the command line the process started with, and the
+# subcommand it names. Called instead of the interface when there are
+# arguments; main decides which.
 proc ::featherweight::script_main {argv} {
     variable json_tools
     variable tools_available
@@ -3869,7 +4013,9 @@ proc ::featherweight::script_main {argv} {
 }
 
 
-# The request that would go out for a session, with no network.
+# What the request would be for a session, with no network: the model, the
+# counts, the fold that would run first. With --replay the other half runs
+# instead: one whole turn from recorded responses, against a copied state.
 proc ::featherweight::script_request {options} {
     variable config
     variable json_tools
@@ -4112,6 +4258,8 @@ proc ::featherweight::load_state_for_inspection {} {
 }
 
 
+# The sessions on disk, one line each: which is current, how big, and which
+# cannot be read.
 proc ::featherweight::session_list {} {
     variable config
 
@@ -4140,6 +4288,8 @@ proc ::featherweight::session_list {} {
 }
 
 
+# One session printed: its messages in order, with their times and tool
+# calls.
 proc ::featherweight::session_show {name last} {
     if {![session_exists $name]} {
         error "no such session: $name"
@@ -4221,6 +4371,7 @@ proc ::featherweight::session_check {} {
 }
 
 
+# The session subcommands of script mode: list, show, check.
 proc ::featherweight::script_session {options} {
     if {[llength $options] == 0} {
         usage_error {session needs list, show, or check}
@@ -4364,6 +4515,10 @@ proc ::featherweight::script_selftest {options} {
     return 0
 }
 
+
+# --- the entry point ---
+#
+# With arguments, script mode; without them, the window.
 
 proc ::featherweight::main {argv0 argv} {
     variable config

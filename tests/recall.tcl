@@ -72,6 +72,10 @@ ok "the message opens with its text" {
     expr {[string first {about zirconium} $out] >= 0
         && [string first "$hit_id \u00b7 turn " $out] == 0}
 }
+set out [recall [dict create id $hit_id pattern zirconium]]
+ok "and the line the query matched carries a >" {
+    expr {[string first "\n> 1: question" $out] >= 0}
+}
 ok "an unknown id says so" {
     expr {[string first {No message has the id} [recall [dict create id t99.99]]] == 0}
 }
