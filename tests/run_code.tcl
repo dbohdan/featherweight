@@ -109,4 +109,10 @@ ok "evaluation here keeps its state, as /eval needs" {
         && [field [::run_code::execute {set y}] result] eq {7}}
 }
 
+ok "the answer's sections are separated by blank lines" {
+    set out [call {puts hi}]
+    expr {[string first "</output>\n\n<result>" $out] >= 0
+        && [string first "</result>\n\n<options>" $out] >= 0}
+}
+
 test::finish

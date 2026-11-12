@@ -23,10 +23,14 @@ ok "the tool's order, not the JSON's" {
     expr {[string first {path:} $out] < [string first {offset:} $out]
         && [string first {offset:} $out] < [string first {limit:} $out]}
 }
-ok "the values line up under the longest name" {
-    expr {[regexp {(?n)^path:\s{3}/tmp/x$} $out]
-        && [regexp {(?n)^offset:\s{1}1130$} $out]
-        && [regexp {(?n)^limit:\s{2}60$} $out]}
+ok "the values line up under the longest name, two spaces at least" {
+    expr {[regexp {(?n)^path:    /tmp/x$} $out]
+        && [regexp {(?n)^offset:  1130$} $out]
+        && [regexp {(?n)^limit:   60$} $out]}
+}
+ok "a blank line separates the arguments" {
+    expr {[string first "/tmp/x\n\noffset:" $out] >= 0
+        && [string first "1130\n\nlimit:" $out] >= 0}
 }
 
 puts "== a multiline value goes on its own line =="

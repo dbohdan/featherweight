@@ -1337,7 +1337,7 @@ proc ::run_code::execute {code} {
         <output>$output</output> \
         <result>$value</result>  \
         <options>$options</options> \
-    ] \n]
+    ] "\n\n"]
 }
 
 
@@ -1763,7 +1763,7 @@ proc ::featherweight::run_code_abandon {token reason} {
         <output></output> \
         <result>$message</result> \
         <options>[dict create -code 1 -errorcode {FEATHERWEIGHT RUN_CODE_TIMEOUT}]</options> \
-    ] \n]
+    ] "\n\n"]
 }
 
 
@@ -2804,7 +2804,7 @@ proc ::featherweight::tool_arguments_text {name raw} {
         }
     }
 
-    set out {}
+    set blocks {}
     foreach key $keys {
         set value [dict get $arguments $key]
         set as_written {}
@@ -2816,13 +2816,18 @@ proc ::featherweight::tool_arguments_text {name raw} {
             set value "\[[join $value {, }]\]"
         }
         if {[string first \n $value] >= 0} {
-            append out "$key:\n$value\n"
+            lappend blocks "$key:\n$value"
         } else {
-            # Padded with spaces, counted in characters: format's %-*s is
-            # meant for display columns and misaligns past the first.
-            append out "$key:[string repeat { } [expr {$width + 2 - [string length $key] - 1}]]$value\n"
+            # Two spaces past the longest name, so the values line up under
+            # it, counted in characters: format's %-*s is meant for display
+            # columns and misaligns past the first.
+            lappend blocks "$key:[string repeat { } [expr {$width + 2 - [string length $key]}]]$value"
         }
     }
+    # A blank line between arguments: where a value runs over several lines,
+    # this is the only mark of where the next name begins.
+    set out [join $blocks "\n\n"]
+    append out \n
     return $out
 }
 
