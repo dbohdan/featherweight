@@ -98,6 +98,9 @@ ok "and closes it again" {
     expr {[tag_value $chat $body -elide]
         && [string first {Thinking [+]} [$chat get 1.0 end]] >= 0}
 }
+ok "the marker is fixed width, so the bracket does not move" {
+    expr {[tag_value $chat "think$::featherweight::thinking_serial" -font] eq {TkFixedFont}}
+}
 
 puts "== run_code still shows its code =="
 ::featherweight::ui_tool_code [call run_code {{"code": "puts hi"}}] {}

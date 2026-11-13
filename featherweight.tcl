@@ -3124,8 +3124,10 @@ proc ::featherweight::ui_thinking {text {time {}}} {
     set w [dict get $W chat]
     $w tag configure body$n -elide 1
     # The marker's own tag carries its color as well as the underline: Tk
-    # draws an underline in the color of the tag that sets it.
-    $w tag configure think$n -foreground #555555 -underline 1
+    # draws an underline in the color of the tag that sets it. Its font is
+    # fixed width, so the closing bracket stays put between [+ and [−: in a
+    # proportional font the minus sign is a little wider than the plus.
+    $w tag configure think$n -foreground #555555 -underline 1 -font TkFixedFont
     $w tag bind think$n <Button-1> [list [namespace current]::ui_thinking_toggle $n]
 }
 
