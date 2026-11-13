@@ -1,34 +1,42 @@
 #! /usr/bin/env tclsh
-# Featherweight -- a small agent harness in one file.
+# Featherweight -- a small agent harness in a single file.
 # Copyright (c) 2026 D. Bohdan
 # License: MIT, https://dbohdan.com/mit-license/2026
 #
-# This application is a chat window where a human talks to a language model.
-# It keeps the conversation, decides what of it fits in the model's context
-# window, sends the request, and runs whatever tools the answer asks for.
-# The core loop is:
+# Developed by D. Bohdan and language models:
+# GPT-6 Luna, DeepSeek V4.1 Flash 1017, Kimi K3.1 Pro, MiMo-V2.6-Flash,
+# MiMo-V2.6-Pro, and GPT-6.1 Terra.
 #
-#   The human's message is added to the session
-#     -> The session, folded to fit, goes out to the model as JSON
-#     -> The answer may name tools; each runs and its result is appended
-#     -> The loop repeats until the answer names no tools
+# Featherweight is an application that presents a chat window where you talk to
+# a language model. The application stores the conversation log, determines
+# how to fit the most recent messages in the model's context window, sends the
+# requests, and runs whatever tools the model asks for.
 #
-# The parts in the order this file introduces them:
+# The core loop is as follows:
 #
-#   state      what the process holds: the configuration, the session it
-#              shows, its windows
-#   record     sessions on disk: append-only files of messages and fold
-#              markers, readable as a Tcl list
-#   size       counting what a request costs, and folding history to fit
-#   wire       the JSON a request is made of
-#   tools      the tools the model calls -- files, Tcl code, recall --
-#              and the call that runs one
-#   turn       one request and its response, tool calls and all
-#   interface  the Tk conversation, its debug log, and its commands
-#   script     the same state without a window, to inspect and replay
+# 1. The user message is added to the session.
+# 2. The session, folded ("compacted") to fit, goes out to the model as JSON.
+# 3. The answer optionally names tools; each tool runs; its result is appended.
+# 4. Step 3 repeats until an answer without tool calls is received.
 #
-# With no arguments the interface starts. Script mode prints instead of
-# showing: tclsh featherweight.tcl debug --help.
+# This source file is organized in sections:
+#
+#   state      The data required to operate the harness: the configuration,
+#              the session, the windows.
+#   record     Working with the sessions on disk: append-only files of messages
+#              and fold markers that are readable as a Tcl list.
+#   size       Measuring requests for context fit and cost.
+#   wire       The JSON a request is made of.
+#   tools      The tools the model calls: file operations, Tcl eval, history
+#              recall.
+#   turn       Request-response pairs, tool calls.
+#   interface  The Tk GUI, its debug log, and its commands.
+#   script     The harness features with no GUI window, for debugging.
+#   entry      The CLI and the command that starts the application.
+#
+# Without arguments Featherweight starts with the Tk user interface.
+# Script mode exists for debugging:
+# $ tclsh featherweight.tcl debug --help
 
 package require Tcl 8.6 9
 
