@@ -91,7 +91,7 @@ ok "the date leads, then a folded Thinking heading" {
 ::featherweight::ui_thinking_toggle $::featherweight::thinking_serial
 ok "the toggle opens it" {
     expr {![tag_value $chat $body -elide]
-        && [string first {Thinking [-]} [$chat get 1.0 end]] >= 0}
+        && [string first "Thinking \[\u2212\]" [$chat get 1.0 end]] >= 0}
 }
 ::featherweight::ui_thinking_toggle $::featherweight::thinking_serial
 ok "and closes it again" {

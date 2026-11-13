@@ -183,7 +183,7 @@ check "a request is logged folded to its header" \
 ::featherweight::debug_toggle $dbg $n
 check "the marker opens it and builds its body" \
     {![tag_value $dbg $body -elide]
-        && [string first {(request) [-]} [$dbg get 1.0 end]] >= 0
+        && [string first "(request) \[\u2212\]" [$dbg get 1.0 end]] >= 0
         && [string first {payload} [$dbg get 1.0 end]] >= 0}
 ::featherweight::debug_toggle $dbg $n
 check "and closes it again" \

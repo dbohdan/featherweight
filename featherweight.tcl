@@ -3133,7 +3133,7 @@ proc ::featherweight::ui_thinking_toggle n {
         set marker {[+]}
     } else {
         $w tag configure body$n -elide 0
-        set marker {[-]}
+        set marker "\[\u2212\]"
     }
     set ranges [$w tag ranges think$n]
     if {[llength $ranges] >= 2} {
@@ -3311,7 +3311,7 @@ proc ::featherweight::debug_toggle {w n} {
             unset debug_text($n)
         }
         $w tag configure body$n -elide 0
-        set marker {[-]}
+        set marker "\[\u2212\]"
     }
     set ranges [$w tag ranges toggle$n]
     if {[llength $ranges] >= 2} {
