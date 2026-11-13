@@ -39,7 +39,7 @@ package require sha256
 
 
 namespace eval ::featherweight {
-    variable version 0.0.0
+    variable version 0.1.0
 
     # Default configuration and state.
     variable config [dict create \
