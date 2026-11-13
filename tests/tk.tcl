@@ -107,6 +107,10 @@ check "the timestamp is the size of the message text" \
 check "only the label is bold" \
     {[font configure $stamp_font -weight] eq {normal}
         && [font configure $label_font -weight] eq {bold}}
+check "the fonts are at the configured size" \
+    {[font actual TkTextFont -size] == [dict get $::featherweight::config font_size]
+        && [font actual TkDefaultFont -size] == [dict get $::featherweight::config font_size]
+        && [font actual TkFixedFont -size] == [dict get $::featherweight::config font_size]}
 
 check "/compact folds the session" \
     {[::featherweight::handle_slash_command {/compact}] == 1}

@@ -309,7 +309,7 @@ ok "no legacy featherweight.conf was written" {
     expr {![file exists [file join $::test::work featherweight.conf]]}
 }
 
-puts "== retries and timeout =="
+puts "== retries, timeout, and font size =="
 set saved [slurp $config_path]
 dict set saved retries -1
 ::fileutil::writeFile -encoding utf-8 $config_path $saved
@@ -322,11 +322,19 @@ fails "a zero timeout is refused" {::featherweight::init_config}
 set saved [slurp $config_path]
 dict set saved retries 5
 dict set saved timeout 300
+dict set saved font_size 3
+::fileutil::writeFile -encoding utf-8 $config_path $saved
+fails "a font size too small to read is refused" {::featherweight::init_config}
+set saved [slurp $config_path]
+dict set saved retries 5
+dict set saved timeout 300
+dict unset saved font_size
 ::fileutil::writeFile -encoding utf-8 $config_path $saved
 ::featherweight::init_config
-ok "the defaults are 5 retries and a 300 second timeout" {
+ok "the defaults are 5 retries, 300 seconds, and a 10 point font" {
     expr {[dict get $::featherweight::config retries] == 5
-        && [dict get $::featherweight::config timeout] == 300}
+        && [dict get $::featherweight::config timeout] == 300
+        && [dict get $::featherweight::config font_size] == 10}
 }
 
 puts "== attached images =="

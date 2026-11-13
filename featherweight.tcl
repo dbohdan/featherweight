@@ -53,6 +53,7 @@ namespace eval ::featherweight {
         timeout 300 \
         exec_timeout 60 \
         run_code_timeout 300 \
+        font_size 10 \
         timestamp_format {%Y-%m-%d %H:%M:%S %z} \
         system_prompt {You are an expert software developer working with a user on their code.
 The user will ask for changes to the code, or ask questions about it.
@@ -331,6 +332,16 @@ proc ::featherweight::init_config {} {
     set run_code_timeout [dict get $config run_code_timeout]
     if {![string is integer -strict $run_code_timeout] || $run_code_timeout < 1} {
         error {run_code_timeout must be an integer of at least 1 second}
+    }
+
+    # The baseline font size, in points, for the conversation, the debug log,
+    # the labels and the input. 10 is the size Tk gives its fonts here.
+    if {![dict exists $config font_size]} {
+        dict set config font_size 10
+    }
+    set font_size [dict get $config font_size]
+    if {![string is integer -strict $font_size] || $font_size < 6} {
+        error {font_size must be an integer of at least 6}
     }
 
     # The current session must name a session file; anything else starts over
@@ -3874,6 +3885,13 @@ proc ::featherweight::build_ui {} {
     update_window_title
 
     set chat [dict get $W chat]
+    # Every font in the window at the configured size: the conversation, the
+    # debug log, the labels, the input. role_font is made from TkTextFont
+    # afterwards, so it comes out at the same size, in bold.
+    set font_size [dict get $config font_size]
+    font configure TkTextFont -size $font_size
+    font configure TkDefaultFont -size $font_size
+    font configure TkFixedFont -size $font_size
     font create ::featherweight::role_font  {*}[font configure TkTextFont]  -weight bold
     $chat tag configure role -font ::featherweight::role_font -foreground #555555
     # The time above each label is the size of the message text: it is the
