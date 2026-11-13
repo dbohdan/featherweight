@@ -6,3 +6,4 @@ featherweight.conf
 *.bak*
 *.sw*
 *.log
+*.wiki
