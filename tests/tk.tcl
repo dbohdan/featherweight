@@ -82,6 +82,13 @@ update
 check "resizing the window widens the input, not the button" \
     {[winfo width .root.input.p.e] > $wide_entry
         && [winfo width .root.input.p.send] == $wide_button}
+set entry [dict get $::featherweight::W entry]
+$entry delete 1.0 end
+$entry insert end {some text to select}
+event generate $entry <Control-a>
+check "Ctrl-A selects all in the input" \
+    {[$entry tag ranges sel] ne {}
+        && [$entry get sel.first sel.last] eq {some text to select}}
 wm geometry . ${wide_window}x[winfo height .]
 update
 

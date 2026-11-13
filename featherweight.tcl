@@ -3866,6 +3866,7 @@ proc ::featherweight::build_ui {} {
     text .root.input.p.e -wrap word -height 4 -width 40 -undo 1
     bind .root.input.p.e <Control-Return> {::featherweight::submit; break}
     bind .root.input.p.e <Control-KP_Enter> {::featherweight::submit; break}
+    bind .root.input.p.e <Control-a> {::featherweight::text_select_all %W; break}
     ttk::button .root.input.p.send -text "Send" -command ::featherweight::submit_or_stop
     .root.input.p add .root.input.p.e -weight 1
     .root.input.p add .root.input.p.send -weight 0
