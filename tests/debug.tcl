@@ -24,6 +24,16 @@ ok "an unknown option exits 2" {
     expr {[dict get $r code] == 2
         && [string first {unknown option: bogus} [dict get $r output]] >= 0}
 }
+set r [run_cli {--help}]
+ok "the help lists the startup options" {
+    expr {[string first {--model} [dict get $r output]] >= 0
+        && [string first {--session} [dict get $r output]] >= 0}
+}
+set r [run_cli {-m}]
+ok "-m needs a model name" {
+    expr {[dict get $r code] == 2
+        && [string first {needs a model name} [dict get $r output]] >= 0}
+}
 set r [run_cli {debug nonsense}]
 ok "an unknown subcommand exits 2" {
     expr {[dict get $r code] == 2
@@ -130,6 +140,11 @@ ok "request prints the model, counts and the payload" {
         && [string first {"messages"} [dict get $r output]] >= 0
         && [string first {automatic fold:} [dict get $r output]] >= 0}
 }
+ok "every parameter of a tool reaches the schema" {
+    expr {[string first {"offset"} [dict get $r output]] >= 0
+        && [string first {"old_string"} [dict get $r output]] >= 0
+        && [string first {"replace_all"} [dict get $r output]] >= 0}
+}
 set r [run_cli {debug request --last 1}]
 ok "request --last lists messages instead of the payload" {
     expr {[dict get $r code] == 0
@@ -166,6 +181,22 @@ set r [run_cli [list debug request --replay $empty]]
 ok "an empty replay file is refused" {
     expr {[dict get $r code] == 1
         && [string first {holds no responses} [dict get $r output]] >= 0}
+}
+
+# The startup options do what /model and /session do, which means they
+# change the state for good; they run last so the checks above keep the
+# state they expect.
+set r [run_cli {-m test-model debug request}]
+ok "-m sets the model the request would use" {
+    expr {[dict get $r code] == 0
+        && [string first {model:} [dict get $r output]] >= 0
+        && [string first {test-model} [dict get $r output]] >= 0}
+}
+set r [run_cli {-s bench debug request}]
+ok "-s sets the session the request would use" {
+    expr {[dict get $r code] == 0
+        && [string first {session:} [dict get $r output]] >= 0
+        && [string first {bench} [dict get $r output]] >= 0}
 }
 
 test::finish

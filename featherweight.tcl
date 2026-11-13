@@ -1207,7 +1207,9 @@ proc ::featherweight::json_tool args {
         set required [dict get $args -required]
     }
 
-    dict for {option value} $args {
+    # foreach, not dict for: a tool's -param appears once per parameter, and
+    # a dict would keep only one of them.
+    foreach {option value} $args {
         switch -- $option {
             -command -
             -name -
@@ -3910,6 +3912,9 @@ proc ::featherweight::usage {} {
 
 With no arguments, the Tk interface starts.
 
+  -m, --model MODEL      start on this model, as /model would
+  -s, --session NAME     start on this session, as /session would
+
 Script mode reads state and prints it. It never sends a request; loading
 the state creates missing files the way starting the interface does, and
 only debug eval can change what is stored:
@@ -4520,11 +4525,67 @@ proc ::featherweight::script_selftest {options} {
 #
 # With arguments, script mode; without them, the window.
 
+# The options the window starts with: -m/--model and -s/--session are the
+# /model and /session its user would otherwise type once it is open. What
+# remains is left alone: nothing, or the debug subcommand of script mode.
+proc ::featherweight::startup_options {argv} {
+    set options [dict create]
+    while {[llength $argv] > 0} {
+        set option [lindex $argv 0]
+        switch -- $option {
+            -m -
+            --model {
+                if {[llength $argv] < 2} {
+                    usage_error "$option needs a model name"
+                }
+                dict set options model [lindex $argv 1]
+            }
+            -s -
+            --session {
+                if {[llength $argv] < 2} {
+                    usage_error "$option needs a session name"
+                }
+                dict set options session [lindex $argv 1]
+            }
+            default {
+                return [list $options $argv]
+            }
+        }
+        set argv [lrange $argv 2 end]
+    }
+    return [list $options $argv]
+}
+
+
+# Do what /model and /session do: set the model or the session, and keep the
+# choice for the next start.
+proc ::featherweight::startup_configure {options} {
+    variable config
+
+    if {[dict exists $options model]} {
+        dict set config model [dict get $options model]
+        save_config
+    }
+    if {[dict exists $options session]} {
+        if {[catch {switch_session [dict get $options session]} error]} {
+            ::puts stderr "Error: $error"
+            exit 1
+        }
+    }
+}
+
+
 proc ::featherweight::main {argv0 argv} {
     variable config
     variable done
     variable json_tools
     variable tools_available
+
+    lassign [startup_options $argv] options argv
+    if {[dict size $options] > 0} {
+        init_config
+        startup_configure $options
+    }
 
     if {[llength $argv] > 0} {
         script_main $argv
