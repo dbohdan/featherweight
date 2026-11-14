@@ -115,4 +115,21 @@ ok "the answer's sections are separated by blank lines" {
         && [string first "</result>\n\n<options>" $out] >= 0}
 }
 
+puts "== the state does not move with a model's cd =="
+# Threads share one working directory, so a model's cd moves [pwd] for
+# everything that follows -- and the state must not go with it.
+set state [::featherweight::state_dir]
+set here [pwd]
+file mkdir move
+::featherweight::tool_run_code [dict create code {cd move}]
+ok "a model's cd is the working directory's to make" {
+    expr {[file tail [pwd]] eq {move}}
+}
+ok "the state directory stays where the harness started" {
+    expr {[::featherweight::state_dir] eq $state
+        && [::featherweight::session_path default] eq [file join $state sessions default]
+        && [::featherweight::config_path] eq [file join $state config]}
+}
+cd $here
+
 test::finish

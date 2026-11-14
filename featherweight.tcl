@@ -49,6 +49,12 @@ package require sha256
 namespace eval ::featherweight {
     variable version 0.1.0
 
+    # Where the process started, and where its state lives. Recorded once:
+    # [pwd] moves whenever the model's code or /eval runs cd -- threads share
+    # one working directory -- and the state must not move with it. To point
+    # the state elsewhere, set this or state_root, never as a side effect.
+    variable project_root [pwd]
+
     # Default configuration and state.
     variable config [dict create \
         debug true \
@@ -205,16 +211,18 @@ namespace eval ::featherweight {
 }
 
 
-# The directory that holds the configuration and the sessions, relative to the
-# project root (the launch directory) -- or wherever script mode has pointed
-# it, for a turn replayed against a copy of the state.
+# The directory that holds the configuration and the sessions, under the
+# project root -- the directory the process started in, recorded once -- or
+# wherever script mode has pointed it, for a turn replayed against a copy of
+# the state.
 proc ::featherweight::state_dir {} {
+    variable project_root
     variable state_root
 
     if {$state_root ne {}} {
         return $state_root
     }
-    return [file join [pwd] featherweight]
+    return [file join $project_root featherweight]
 }
 
 
@@ -1580,12 +1588,13 @@ proc ::featherweight::tool_edit_file arguments {
 proc ::featherweight::tool_about arguments {
     variable version
     variable process_started
+    variable project_root
     variable config
 
     set now [clock seconds]
     set script [file normalize [info script]]
     set tk_version [expr {[catch {package present Tk} version] ? {unavailable} : $version}]
-    set lines [list  Featherweight  "Version: $version"  "Script: $script"  "Script modified: [clock format [file mtime $script] -format {%Y-%m-%d %H:%M:%S UTC} -gmt 1]"  "Process started: [clock format $process_started -format {%Y-%m-%d %H:%M:%S UTC} -gmt 1]"  {}  Time  "Now (UTC): [clock format $now -format {%Y-%m-%d %H:%M:%S UTC, %A} -gmt 1]"  "Now (local): [clock format $now -format {%Y-%m-%d %H:%M:%S %Z}]"  {}  System  "Tcl: [info patchlevel]"  "Tk: $tk_version"  "OS: $::tcl_platform(os)"  "OS version: $::tcl_platform(osVersion)"  "Architecture: $::tcl_platform(machine)"  "Platform: $::tcl_platform(platform)"  {}  Session  "Model: [dict get $config model]"  "Current session: [dict get $config current_session]"  "Project root: [pwd]"  ]
+    set lines [list  Featherweight  "Version: $version"  "Script: $script"  "Script modified: [clock format [file mtime $script] -format {%Y-%m-%d %H:%M:%S UTC} -gmt 1]"  "Process started: [clock format $process_started -format {%Y-%m-%d %H:%M:%S UTC} -gmt 1]"  {}  Time  "Now (UTC): [clock format $now -format {%Y-%m-%d %H:%M:%S UTC, %A} -gmt 1]"  "Now (local): [clock format $now -format {%Y-%m-%d %H:%M:%S %Z}]"  {}  System  "Tcl: [info patchlevel]"  "Tk: $tk_version"  "OS: $::tcl_platform(os)"  "OS version: $::tcl_platform(osVersion)"  "Architecture: $::tcl_platform(machine)"  "Platform: $::tcl_platform(platform)"  {}  Session  "Model: [dict get $config model]"  "Current session: [dict get $config current_session]"  "Project root: $project_root"  ]
     return [join $lines \n]\n
 }
 
@@ -3237,6 +3246,7 @@ proc ::featherweight::pretty {raw} {
 proc ::featherweight::debug_log {category text {label {}}} {
     variable config
     variable W
+    variable project_root
     variable debug_entry
     variable debug_open
     variable debug_text
@@ -3287,7 +3297,7 @@ proc ::featherweight::debug_log {category text {label {}}} {
         return
     }
     if {[catch {
-        set fh [open [file join [pwd] featherweight-debug.log] a]
+        set fh [open [file join $project_root featherweight-debug.log] a]
         ::puts $fh "$ts ($category) $text"
         close $fh
     }]} {}
