@@ -47,7 +47,7 @@ package require sha256
 
 
 namespace eval ::featherweight {
-    variable version 0.1.0
+    variable version 0.1.1
 
     # Where the process started, and where its state lives. Recorded once:
     # [pwd] moves whenever the model's code or /eval runs cd -- threads share
