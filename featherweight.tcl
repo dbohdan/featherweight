@@ -2806,7 +2806,11 @@ proc ::featherweight::request_async {} {
 
     set curl_data($ch) {}
     set request_channels($ch) 1
-    fconfigure $ch -blocking 0
+    # The response is UTF-8 -- JSON always is -- so say so: on Windows the
+    # system encoding is the ANSI codepage, which would decode it as mojibake
+    # before the conversation ever renders. On Linux this is what the system
+    # encoding already was, which is why it went unnoticed.
+    fconfigure $ch -encoding utf-8 -blocking 0
     fileevent $ch readable [list [namespace current]::request_readable $ch]
 }
 
@@ -2864,14 +2868,25 @@ proc ::featherweight::request_readable ch {
         return
     }
 
-    if {![string is integer -strict $exit_code]} {
+    # A curl too old to write %{exitcode} (7.53, for Windows XP) leaves the
+    # exit code empty: unknown, not failed. Only a non-integer that is not
+    # empty means the line itself is broken.
+    if {$exit_code ne {} && ![string is integer -strict $exit_code]} {
         debug_log error "invalid exit code from curl: $exit_code"
         set_ui_busy 0
         return
     }
 
-    if {$exit_code != 0} {
+    if {$exit_code ne {} && $exit_code != 0} {
         retry_request "curl ($exit_code): $error_msg"
+        return
+    }
+    if {$status == 000} {
+        # curl finished without an HTTP response: it could not connect,
+        # timed out, or lost the connection. An old curl says this with a
+        # status alone; when it reports an exit code the branch above has
+        # already named curl's own words for it.
+        retry_request "curl ended without an HTTP response"
         return
     }
     set retry_count 0

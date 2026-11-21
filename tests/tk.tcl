@@ -323,6 +323,28 @@ check "a dropped request is retried before giving up" \
 check "the turn stops once the retries are spent" \
     {$::featherweight::busy == 0}
 
+# A trailing line with an HTTP status and no exit code -- what a curl too
+# old for %{exitcode} writes (7.53, for Windows XP) -- must still count as a
+# failure when there is no HTTP response at all. Fed through the real reader
+# from a file channel, so close stays clean exactly as it does after a
+# non-blocking drain.
+set xp_reply [file join $::test::work xp-no-exitcode.txt]
+::fileutil::writeFile -encoding utf-8 $xp_reply "BODY\n000"
+set xp_channel [open $xp_reply r]
+set ::featherweight::curl_data($xp_channel) {}
+set ::featherweight::request_channels($xp_channel) 1
+set ::featherweight::retry_count 0
+set ::featherweight::busy 1
+::featherweight::request_readable $xp_channel
+set xp_retries $::featherweight::retry_count
+set xp_busy $::featherweight::busy
+set ::featherweight::busy 0
+# request_readable already dropped the channel from both arrays on its way out.
+unset -nocomplain ::featherweight::curl_data($xp_channel)
+unset -nocomplain ::featherweight::request_channels($xp_channel)
+check "a response without an exit code retries when no HTTP status came" \
+    {$xp_retries == 1 && $xp_busy == 1}
+
 catch {destroy .}
 
 test::finish
